@@ -51,7 +51,8 @@ def build_import_graph(
     bind_node 必须 await node(state, deps=deps)，统一设置阶段、记录日志和进度，
     将普通异常转为 NodeError。已有错误须保留；handle_error 自身失败时由
     执行器/Service 兜底，取消由 Service/finally 清理，不递归进入错误节点。
-    公共执行器仍待实现；现有 node_log 不能代替异常转 State 的执行边界。
+    公共执行器见 utils.node_execution.bind_node，当前仅 entry 已实现并验证；
+    现有 node_log 仍不能代替异常转 State 的执行边界。
     """
     expected = set(REQUIRED_NODES)
     supplied = set(nodes)
@@ -187,7 +188,7 @@ if __name__ == "__main__":
 
     # 仅为画图提供测试函数。误执行时明确报错，不返回空结果冒充业务成功。
     async def preview_only_node(state: ImportState, *, deps: object) -> dict[str, Any]:
-        raise NotImplementedError("此函数仅用于结构预览，业务节点尚未实现")
+        raise NotImplementedError("此函数仅用于结构预览，不允许执行业务")
 
     preview_deps = object()
     bindings = []
@@ -210,6 +211,6 @@ if __name__ == "__main__":
     expected_edges.update((name, "handle_error") for name in NORMAL_NODES)
     assert {(edge.source, edge.target) for edge in diagram.edges} == expected_edges
     assert all(edge.conditional for edge in diagram.edges if edge.source in NORMAL_NODES)
-    print("\n===== 导入图结构预览（业务节点 0/9，未执行业务流程）=====\n")
+    print("\n===== 导入图结构预览（entry 已实现待审核，本次不执行业务流程）=====\n")
     diagram.print_ascii()
     print("\n真实编译、依赖绑定及全部边的结构检查通过。")

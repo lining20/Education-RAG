@@ -29,6 +29,7 @@ class SourceFile(TypedDict):
     object_key: str
     format: Literal["md", "docx", "pdf"]
     fingerprint: str
+    import_manifest_key: str  # 任务级成功清单对象键；finish 最后写入，查询校验此清单。
 
 
 class ParsedBlock(TypedDict):
@@ -43,7 +44,7 @@ class ParsedBlock(TypedDict):
 
 
 class ContentRecord(TypedDict):
-    """MongoDB 完整内容记录；payload 保存课程层级或完整题目等结构。"""
+    """完整内容中间对象；投影到 Milvus.record_payload，超长内容转为 MinIO JSON。"""
 
     record_id: str
     task_id: str
@@ -112,14 +113,15 @@ class ImportState(TypedDict):
 
     节点只返回本次修改字段的增量字典，不原地改 State。当前串行图采用
     默认覆盖语义，warnings/统计等需要返回更新后的完整字段值，不自动追加。
-    任务表只持久化统计和产物引用，不持久化整份 State 或全部向量。
+    内存任务表只保留统计和产物引用，不复制整份 State 或全部向量。
     """
 
-    # Service 已创建 pending 任务和临时文件；entry 再次校验，不在这里生成 ID。
+    # Service 已在内存中创建 pending 任务和临时文件；entry 再次校验，不在这里生成 ID。
     task_id: str
     document_id: str
     file_path: str
     upload_metadata: DataDict
+    task_claimed: bool  # 只有领取成功的调用可在失败时清理本任务产物。
 
     source_file: SourceFile | None  # save_file 成功前为 None，不伪造归档信息。
     parsed_blocks: list[ParsedBlock]
@@ -156,6 +158,7 @@ def create_initial_state(
         "document_id": document_id,
         "file_path": file_path,
         "upload_metadata": deepcopy(upload_metadata) if upload_metadata is not None else {},
+        "task_claimed": False,
         "source_file": None,
         "parsed_blocks": [],
         "document_metadata": {},

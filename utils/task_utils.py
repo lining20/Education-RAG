@@ -1,187 +1,215 @@
-from typing import Dict, List
-from .sse_utils import push_to_session
+"""单进程导入任务与节点进度；线程锁保护，状态仅保存在内存中。
 
-# ---------------------------
-# 内存态任务追踪（单进程）
-# ---------------------------
-# key: task_id
-# value: 节点名列表（原始英文/节点ID）
-_tasks_running_list: Dict[str, List[str]] = {}
-_tasks_done_list: Dict[str, List[str]] = {}
+Service 创建 pending 任务，节点在主函数首尾显式调用进度工具。不连接 MongoDB；
+进程重启后记录丢失，任务查询应报告不存在，不能把内存用作知识库发布依据。
+"""
+from copy import deepcopy
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
+import re
+from threading import RLock
+from time import perf_counter
+from typing import Any
 
-# key: task_id
-# value: status 字符串（如 pending/processing/completed/failed）
-_tasks_status: Dict[str, str] = {}
-
-# key: task_id
-# value: 任务结果（例如 query 的 answer）
-_tasks_result: Dict[str, Dict[str, str]] = {}
-
-TASK_STATUS_PENDING = "pending"
-TASK_STATUS_PROCESSING = "processing"
-TASK_STATUS_COMPLETED = "completed"
-TASK_STATUS_FAILED = "failed"
-
-# 节点名 -> 中文名映射（用于前端展示）
-# 说明：这里的 key 应与 LangGraph 的 add_node("xxx", ...) 中的节点名一致。
-_NODE_NAME_TO_CN: Dict[str, str] = {
-    "upload_file": "开始上传文件",
-    "node_entry": "检查文件",
-    "node_pdf_to_md": "PDF转Markdown",
-    "node_md_img": "Markdown图片处理",
-    "node_item_name_recognition": "主体名称识别",
-    "node_document_split": "文档切分",
-    "node_bge_embedding": "向量生成",
-    "node_import_kg": "导入知识图谱",
-    "node_import_milvus": "导入向量库",
-    "__end__": "处理完成",
-    "END": "处理完成",
-    # --- Query 流程节点（kb/query_process/main_graph.py）---
-    "node_item_name_confirm": "确认问题产品",
-    "node_answer_output": "生成答案",
-    "node_rerank": "重排序",
-    "node_rrf": "倒排融合",
-    "node_web_search_mcp": "网络搜索",
-    "node_search_embedding": "切片搜索",
-    "node_search_embedding_hyde": "切片搜索(假设性文档)",
-    "node_multi_search": "多路搜索",
-    "node_query_kg": "查询知识图谱",
-    "node_join": "多路搜索合并",
-}
+from common.errors import OperationError
 
 
-def _ensure_task(task_id: str) -> None:
-    """确保 task_id 对应的数据结构已初始化。"""
-    if task_id not in _tasks_running_list:
-        _tasks_running_list[task_id] = []
-    if task_id not in _tasks_done_list:
-        _tasks_done_list[task_id] = []
-    if task_id not in _tasks_result:
-        _tasks_result[task_id] = {}
+# 只跟踪本次调用成功领取的阶段，防止重复调用者在异常时改写他人的进度。
+_claimed_nodes: ContextVar[set[str] | None] = ContextVar("claimed_import_nodes", default=None)
 
 
-def _to_cn(node_name: str) -> str:
-    """将节点名转换为中文展示名；若无映射则返回原名。"""
-    return _NODE_NAME_TO_CN.get(node_name, node_name)
+@contextmanager
+def track_node_progress():
+    claimed: set[str] = set()
+    token = _claimed_nodes.set(claimed)
+    try:
+        yield claimed
+    finally:
+        _claimed_nodes.reset(token)
 
 
-def add_running_task(task_id: str, node_name: str, is_stream: bool = False) -> None:
-    """
-    添加“正在运行”的节点任务。
-
-    参数：
-    - task_id: 任务ID
-    - node_name: 节点名称(节点ID)
-    """
-    _ensure_task(task_id)
-    running = _tasks_running_list[task_id]
-    # 避免重复追加
-    if node_name not in running:
-        running.append(node_name)
-
-    if is_stream:
-        task_push_queue(task_id)
+def validate_identifier(value: Any, field: str) -> str:
+    """沿用字符串 ID 合同，不强制 UUID，不静默修正调用方输入。"""
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or not value.isprintable() or len(value.encode("utf-8")) > 64):
+        raise OperationError("INVALID_IDENTIFIER", f"{field} 必须为非空、无首尾空白的字符串，最多 64 个 UTF-8 字节")
+    return value
 
 
-def add_done_task(task_id: str, node_name: str, is_stream: bool = False) -> None:
-    """
-    添加“已完成”的节点任务。
-
-    注意：添加已完成任务时，会把同名的“正在运行”任务删除。
-
-    参数：
-    - task_id: 任务ID
-    - node_name: 节点名称(节点ID)
-    """
-    _ensure_task(task_id)
-
-    # 1) 从 running 中移除同名节点（可能出现重复，移除所有）
-    running = _tasks_running_list[task_id]
-    _tasks_running_list[task_id] = [n for n in running if n != node_name]
-
-    # 2) 追加到 done（保持完成顺序），避免重复
-    done = _tasks_done_list[task_id]
-    if node_name not in done:
-        done.append(node_name)
-
-    if is_stream:
-        task_push_queue(task_id)
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
-def set_task_result(task_id: str, key: str, value: str) -> None:
-    """
-    存储任务结果字段（如 answer / error）。
-    """
-    _ensure_task(task_id)
-    _tasks_result[task_id][key] = value
+class ImportTaskStore:
+    """注入同一个实例以共享任务进度；所有快照深拷贝，不暴露内部可变容器。"""
+
+    def __init__(self):
+        self._tasks: dict[str, dict[str, Any]] = {}
+        self._lock = RLock()
+
+    def create_pending(self, task_id: str, document_id: str) -> None:
+        """由 Service 在调度前调用；重复任务不得覆盖已有运行状态。"""
+        validate_identifier(task_id, "task_id")
+        validate_identifier(document_id, "document_id")
+        with self._lock:
+            if task_id in self._tasks:
+                raise OperationError("TASK_STATE_CONFLICT", "任务已存在，不能重复创建")
+            self._tasks[task_id] = {
+                "task_id": task_id, "document_id": document_id, "status": "pending",
+                "current_node": "", "counts": {}, "node_progress": {}, "result": {},
+                "created_at": _now_ms(),
+            }
+
+    def _get_task(self, task_id: str, document_id: str) -> dict:
+        validate_identifier(task_id, "task_id")
+        validate_identifier(document_id, "document_id")
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise OperationError("TASK_NOT_FOUND", "内存任务不存在；请先创建任务或重新提交")
+        if task["document_id"] != document_id:
+            raise OperationError("TASK_DOCUMENT_MISMATCH", "任务与来源文档不匹配")
+        return task
+
+    @staticmethod
+    def _validate_node(node: str) -> None:
+        if not isinstance(node, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", node):
+            raise ValueError("节点注册键格式非法")
+
+    async def start_pending(self, task_id: str, document_id: str, counts: dict) -> None:
+        """原子领取 pending 任务；并发重复启动只能成功一次。"""
+        with self._lock:
+            task = self._get_task(task_id, document_id)
+            if task["status"] != "pending":
+                raise OperationError("TASK_STATE_CONFLICT", "任务已非 pending，不能重复启动或重置")
+            now = _now_ms()
+            task.update(status="running", current_node="entry", counts=deepcopy(counts),
+                        started_at=now, updated_at=now)
+            task["node_progress"]["entry"] = {"status": "running", "started_at": now}
+
+    def reject_pending(self, task_id: str, document_id: str, error: dict) -> bool:
+        """输入校验失败时结束仍未被领取的任务；不影响并发运行者或授予清理资格。"""
+        with self._lock:
+            try:
+                task = self._get_task(task_id, document_id)
+            except OperationError:
+                return False  # 无效/不存在/归属不符的标识不能修改任何任务。
+            if task["status"] != "pending":
+                return False
+            now = _now_ms()
+            task.update(status="failed", current_node="entry", finished_at=now, updated_at=now,
+                        result={"status": "failed", "error": deepcopy(error)})
+            task["node_progress"]["entry"] = {"status": "failed", "finished_at": now, "error": deepcopy(error)}
+            return True
+
+    async def start_node(self, task_id: str, document_id: str, node: str, previous_node: str) -> None:
+        """上一阶段完成后才领取下一阶段，不覆盖其他执行中的进度。"""
+        self._validate_node(node)
+        self._validate_node(previous_node)
+        with self._lock:
+            task = self._get_task(task_id, document_id)
+            if (task["status"] != "running" or task["current_node"] != previous_node
+                    or task["node_progress"].get(previous_node, {}).get("status") != "completed"):
+                raise OperationError("TASK_STATE_CONFLICT", "前序阶段尚未完成或已被其他调用推进")
+            now = _now_ms()
+            task.update(current_node=node, updated_at=now)
+            task["node_progress"][node] = {"status": "running", "started_at": now}
+
+    def _running_stage(self, task_id: str, document_id: str, node: str) -> dict:
+        self._validate_node(node)
+        task = self._get_task(task_id, document_id)
+        if (task["status"] != "running" or task["current_node"] != node
+                or task["node_progress"].get(node, {}).get("status") != "running"):
+            raise OperationError("TASK_STATE_CONFLICT", "任务阶段已改变，不能覆盖当前进度")
+        return task
+
+    async def complete_node(self, task_id: str, document_id: str, node: str,
+                            duration_ms: float, counts: dict | None = None) -> None:
+        """节点完成不等于整个任务成功；只记录阶段完成及耗时。"""
+        with self._lock:
+            task = self._running_stage(task_id, document_id, node)
+            now = _now_ms()
+            task["node_progress"][node].update(status="completed", finished_at=now, duration_ms=duration_ms)
+            if counts is not None:
+                task["counts"] = deepcopy(counts)
+            task["updated_at"] = now
+
+    async def fail_node(self, task_id: str, document_id: str, node: str, error: dict) -> None:
+        """仅已领取的运行阶段可记失败；重复启动者不能修改他人的任务。"""
+        with self._lock:
+            task = self._running_stage(task_id, document_id, node)
+            now = _now_ms()
+            task["node_progress"][node].update(status="failed", finished_at=now, error=deepcopy(error))
+            task["updated_at"] = now
+
+    def set_task_result(self, task_id: str, document_id: str, status: str, result: dict) -> None:
+        """最终节点/执行层收尾使用；发布到知识库仍须另写 MinIO 成功清单。"""
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("最终任务状态只能是 succeeded 或 failed")
+        with self._lock:
+            task = self._get_task(task_id, document_id)
+            phase = task["node_progress"].get(task["current_node"], {}).get("status")
+            if (task["status"] != "running" or
+                    (status == "succeeded" and (task["current_node"] != "finish" or phase != "completed")) or
+                    (status == "failed" and phase != "failed")):
+                raise OperationError("TASK_STATE_CONFLICT", "当前执行没有结束此任务的条件")
+            task.update(status=status, result=deepcopy(result), finished_at=_now_ms())
+
+    def get(self, task_id: str) -> dict:
+        """返回状态及运行/完成/失败节点列表；重启后不存在的任务明确报错。"""
+        validate_identifier(task_id, "task_id")
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise OperationError("TASK_NOT_FOUND", "内存任务不存在，服务重启后请重新提交")
+            result = deepcopy(task)
+            for key, status in (("running_nodes", "running"), ("completed_nodes", "completed"), ("failed_nodes", "failed")):
+                result[key] = [name for name, progress in task["node_progress"].items() if progress["status"] == status]
+            return result
+
+    def clear(self, task_id: str) -> None:
+        """由 Service 在保留期结束后释放终态任务，避免进程内无限积累。"""
+        with self._lock:
+            task = self.get(task_id)
+            if task["status"] not in {"succeeded", "failed"}:
+                raise OperationError("TASK_STATE_CONFLICT", "不能清除尚未结束的任务")
+            del self._tasks[task_id]
 
 
-def get_task_result(task_id: str, key: str, default: str = "") -> str:
-    """
-    获取任务结果字段（如 answer / error）。
-    """
-    _ensure_task(task_id)
-    return _tasks_result.get(task_id, {}).get(key, default)
+_task_store = ImportTaskStore()
+
+
+def get_task_store() -> ImportTaskStore:
+    """单进程内复用；启动多个 worker 会各有一份内存任务表，本期不支持。"""
+    return _task_store
+
+
+async def add_running_task(state: dict, node: str, *, tasks: ImportTaskStore) -> float:
+    """在节点第一步登记运行；entry 同时原子领取 pending 任务。"""
+    if node == "entry":
+        await tasks.start_pending(state["task_id"], state["document_id"], state["counts"])
+    else:
+        await tasks.start_node(state["task_id"], state["document_id"], node, state["current_node"])
+    claimed = _claimed_nodes.get()
+    if claimed is not None:
+        claimed.add(node)
+    return perf_counter()
+
+
+async def add_done_task(state: dict, node: str, *, tasks: ImportTaskStore,
+                        started_at: float, counts: dict | None = None) -> None:
+    """全部业务步骤成功后调用：移出运行列表，加入已完成列表。"""
+    await tasks.complete_node(state["task_id"], state["document_id"], node,
+                              round((perf_counter() - started_at) * 1000, 3), counts)
+
+
+def get_running_task_list(task_id: str) -> list[str]:
+    return get_task_store().get(task_id)["running_nodes"]
+
+
+def get_done_task_list(task_id: str) -> list[str]:
+    return get_task_store().get(task_id)["completed_nodes"]
 
 
 def get_task_status(task_id: str) -> str:
-    """
-    获取当前任务状态。
-
-    参数：
-    - task_id: 任务ID
-
-    返回：
-    - str: 状态名称；如果未设置过则返回空字符串
-    """
-    return _tasks_status.get(task_id, "")
-
-
-def get_done_task_list(task_id: str) -> List[str]:
-    """
-    获取已完成节点列表（中文展示）。
-
-
-    """
-    _ensure_task(task_id)
-    done = _tasks_done_list.get(task_id, [])
-    return [_to_cn(n) for n in done]
-
-
-def get_running_task_list(task_id: str) -> List[str]:
-    """
-    获取正在运行节点列表（中文展示）。
-
-    """
-    _ensure_task(task_id)
-    running = _tasks_running_list.get(task_id, [])
-    return [_to_cn(n) for n in running]
-
-
-def update_task_status(task_id: str, status_name: str, push_queue: bool = False) -> None:
-    """
-    更新任务状态。
-
-    参数：
-    - task_id: 任务ID
-    - status_name: 状态名称（字符串）
-    """
-    _tasks_status[task_id] = status_name
-    if push_queue:
-        task_push_queue(task_id)
-
-
-def task_push_queue(task_id: str):
-    push_to_session(task_id, "progress", {
-        "status": get_task_status(task_id),
-        "done_list": get_done_task_list(task_id),
-        "running_list": get_running_task_list(task_id),
-    })
-
-
-#
-def clear_task(task_id: str):
-    _tasks_running_list.pop(task_id, None)
-    _tasks_done_list.pop(task_id, None)
-    _tasks_status.pop(task_id, None)
-    _tasks_result.pop(task_id, None)
+    return get_task_store().get(task_id)["status"]

@@ -59,7 +59,7 @@ def fetch_chunks_by_chunk_ids(
     :param client: MilvusClient实例
     :param collection_name: 集合名称
     :param chunk_ids: 待查询的chunk_id列表
-    :param output_fields: 需要返回的字段列表，默认返回核心切片字段
+    :param output_fields: 需要返回的字段列表，默认返回切片、完整内容及清单字段
     :param batch_size: 分批查询大小，避免单次查询数据量过大，默认100
     :return: List[dict]，Milvus实体字典列表，查询失败返回空列表
     """
@@ -73,6 +73,7 @@ def fetch_chunks_by_chunk_ids(
         output_fields = [
             "chunk_id", "record_id", "task_id", "content",
             "source_file_name", "source_object_key", "source_locator",
+            "record_payload", "payload_object_key", "import_manifest_key",
         ]
 
     # 三个集合均使用应用生成的字符串 UUID 主键。
@@ -181,6 +182,7 @@ def hybrid_search(client, collection_name, reqs, ranker_weights=None, norm_score
             output_fields = [
                 "chunk_id", "record_id", "task_id", "content",
                 "source_file_name", "source_object_key", "source_locator",
+            "record_payload", "payload_object_key", "import_manifest_key",
             ]
 
         # 执行混合搜索：融合稠密+稀疏向量结果，按权重重新排序

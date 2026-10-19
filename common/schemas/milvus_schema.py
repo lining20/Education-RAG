@@ -3,6 +3,8 @@
 from pymilvus import CollectionSchema, DataType, MilvusClient
 
 DEFAULT_DENSE_DIM = 1024
+# 小于 Milvus JSON 64 KiB 上限的保守预算；构建器按实际序列化字节校验。
+MAX_INLINE_PAYLOAD_BYTES = 60000
 COURSE_ENTITY_TYPES = ("series", "course")
 DOCUMENT_CONTENT_TYPES = ("document_chunk", "project_material")
 QUESTION_TYPE_LABELS = {
@@ -58,9 +60,11 @@ def _base_schema(dense_dim):
         is_primary=True, description="应用生成的稳定 UUID 字符串，任务内重试复用",
     )
     _add_strings(schema, (
-        ("record_id", 64, "MongoDB 完整内容记录 ID"),
+        ("record_id", 64, "完整业务记录 ID；多个向量片段可关联同一记录"),
         ("document_id", 64, "原始文档 ID"),
-        ("task_id", 64, "导入任务 ID，用于发布校验和失败清理"),
+        ("task_id", 64, "导入任务 ID，用于清单核验和失败清理"),
+        ("import_manifest_key", 2048, "MinIO 任务成功清单对象键；查询必须核验"),
+        ("payload_object_key", 2048, "完整记录超过 JSON 预算时的 MinIO JSON 对象键；普通记录为空"),
         ("content", 65535, "实际参与向量化的检索文本，限制为 UTF-8 字节数"),
         ("source_file_name", 1024, "原始来源文件名，含扩展名"),
         ("source_object_key", 2048, "原文件在 MinIO 中的对象键"),
@@ -75,6 +79,10 @@ def _base_schema(dense_dim):
     schema.add_field(
         field_name="source_locator", datatype=DataType.JSON,
         description="标题路径、段落、页码或行号，以及转换产物定位信息；未知传 {}",
+    )
+    schema.add_field(
+        field_name="record_payload", datatype=DataType.JSON,
+        description="完整 ContentRecord：原始课程/题目/片段及元数据，不是向量文本摘要；超限时 {} 并提供 payload_object_key",
     )
     schema.add_field(
         field_name="created_at", datatype=DataType.INT64,
@@ -97,7 +105,7 @@ def _add_course_context(schema, *, require_series=False):
 
 
 def build_courses_schema(dense_dim: int = DEFAULT_DENSE_DIM) -> CollectionSchema:
-    """课程系列/子课程检索集合。完整层级和详情保存在 MongoDB。
+    """课程系列/子课程集合；完整层级和详情随行保存在 record_payload。
 
     entity_type=series 时 course_id/course_name 为空串；entity_type=course
     时两者必须由业务校验保证非空。课时和学时未知时传 None，不能用 0 代替。
@@ -137,7 +145,7 @@ def build_document_chunks_schema(dense_dim: int = DEFAULT_DENSE_DIM) -> Collecti
 
 
 def build_questions_schema(dense_dim: int = DEFAULT_DENSE_DIM) -> CollectionSchema:
-    """题目检索集合。完整题干、选项、答案和解析保存在 MongoDB。
+    """题目集合；record_payload.payload 保存完整题干、选项、答案和解析。
 
     question_type 使用 QUESTION_TYPE_LABELS 中的编码；question_type_name
     保留原始题型。无法识别但原文有题型时用 other，缺失则两字段留空。
@@ -180,3 +188,23 @@ def build_document_chunks_index_params():
 
 def build_questions_index_params():
     return _build_indexes(("question_bank_id", "question_code", "question_type"))
+
+
+if __name__ == "__main__":
+    # 仅构造真实 SDK Schema，不创建客户端/集合或连接服务。
+    builders = (build_courses_schema, build_document_chunks_schema, build_questions_schema)
+    required = {"record_payload", "payload_object_key", "import_manifest_key", "content",
+                "record_id", "chunk_id", "task_id", "dense_vector", "sparse_vector"}
+    counts = []
+    for builder in builders:
+        schema = builder()
+        fields = {field.name: field for field in schema.fields}
+        assert required <= fields.keys()
+        assert fields["record_payload"].dtype == DataType.JSON
+        assert fields["dense_vector"].params["dim"] == 1024
+        assert fields["chunk_id"].is_primary and not schema.auto_id
+        assert not schema.enable_dynamic_field
+        counts.append(len(fields))
+    assert counts == [29, 29, 27], counts
+    assert MAX_INLINE_PAYLOAD_BYTES < 65536
+    print("三集合 Schema 自检通过：字段数 29/29/27；完整内容与向量共存，未连接服务。")

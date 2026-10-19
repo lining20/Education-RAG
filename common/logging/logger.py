@@ -1,167 +1,183 @@
-"""
-项目日志工具类
-基于loguru实现，支持.env配置控制台/文件双输出，自动生成logs/app_年月日.log
-特性：
-1. 配置驱动：通过.env开关输出、修改日志级别
-2. 自动路径：文件日志默认输出到 项目根/logging/app_YYYYMMDD.log
-3. 自动清理：按配置保留日志，自动删除过期文件
-4. 中文友好：utf-8编码，彻底解决中文乱码
-5. 异步安全：开启异步入队，支持多线程/异步场景，避免日志错乱
-6. 开箱即用：项目所有模块直接导入logger即可使用
-7. 位置终极精准：穿透loguru内部+工具类自身，完美显示业务模块实际调用位置
-"""
-import sys
-import inspect
-from pathlib import Path
-import os
-from dotenv import load_dotenv
-from loguru import logger
+"""共享日志：同步/异步装饰器、任务上下文、单调计时与安全异常栈。
 
+导入不创建日志文件或移除 sink；应用入口显式调用 init_logger()，可重复调用。
+节点边界记录一次栈，步骤只记录摘要；装饰器重新抛错，不负责图路由。
+"""
+from collections.abc import Mapping
+from functools import wraps
+import inspect
+import sys
+from threading import Lock
+from time import perf_counter
+import traceback
+from typing import Any, Callable
+from loguru import logger as _logger
+from common.config._env import env_bool, env_text
+from common.errors import error_summary
 from utils.path_util import PROJECT_ROOT
 
-# -------------------------- 第一步：加载.env配置文件 --------------------------
-load_dotenv()
-
-# -------------------------- 第二步：读取.env配置（带默认值，防止配置缺失） --------------------------
-LOG_CONSOLE_ENABLE = os.getenv("LOG_CONSOLE_ENABLE", "True").lower() == "true"
-LOG_CONSOLE_LEVEL = os.getenv("LOG_CONSOLE_LEVEL", "INFO").upper()
-LOG_FILE_ENABLE = os.getenv("LOG_FILE_ENABLE", "True").lower() == "true"
-LOG_FILE_LEVEL = os.getenv("LOG_FILE_LEVEL", "INFO").upper()
-LOG_FILE_RETENTION = os.getenv("LOG_FILE_RETENTION", "7 days")
-
-# -------------------------- 第三步：定义日志路径（自动推导项目根） --------------------------
 LOG_DIR = PROJECT_ROOT / "logs"
-LOG_FILE_NAME = "app_{time:YYYYMMDD}.log"
-LOG_FILE_PATH = LOG_DIR / LOG_FILE_NAME
-
-# -------------------------- 第四步：定义日志格式（彩色、结构化、易读） --------------------------
+LOG_FILE_PATH = LOG_DIR / "app_{time:YYYYMMDD}.log"
 LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
-    "<cyan>{name: <20}</cyan>:<cyan>{function: <15}</cyan>:<cyan>{line: <4}</cyan> - "
+    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
     "<level>{message}</level>"
 )
+_init_lock = Lock()
+_initialized = globals().get("_initialized", False)
+_sink_ids = globals().get("_sink_ids", [])
 
-# -------------------------- 第五步：初始化日志配置（核心方法） --------------------------
+
+def fix_log_position(record: dict[str, Any]) -> None:
+    """补齐上下文字段，跳过日志模块自身和 Loguru 栈帧。"""
+    for key in ("flow", "task_id", "document_id", "request_id", "session_id", "conversation_id",
+                "node", "step", "status", "duration_ms"):
+        record["extra"].setdefault(key, "-")
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            module = frame.f_globals.get("__name__", "")
+            if module != __name__ and not module.startswith("loguru"):
+                record.update(name=module, function=frame.f_code.co_name, line=frame.f_lineno)
+                break
+            frame = frame.f_back
+    finally:
+        del frame
+
+
+logger = _logger.patch(fix_log_position)
+
+
+def format_log_record(record: dict[str, Any]) -> str:
+    """处理器也接收第三方原生 Loguru；不假设它经过项目 patch。"""
+    for key in ("flow", "task_id", "document_id", "request_id", "session_id", "conversation_id",
+                "node", "step", "status", "duration_ms"):
+        record["extra"].setdefault(key, "-")
+    return LOG_FORMAT + "\n{exception}"
+
+
 def init_logger():
-    """
-    初始化全局日志配置
-    1. 移除loguru默认控制台输出（避免重复打印）
-    2. 根据.env配置开启/关闭控制台输出
-    3. 根据.env配置开启/关闭文件输出（自动创建logs文件夹）
-    4. 配置日志格式、级别、分割、保留策略
-    :return: 配置完成的loguru logger实例
-    """
-    # 1. 移除loguru默认的控制台输出
-    logger.remove()
-
-    # 2. 配置控制台输出（若.env开启）
-    if LOG_CONSOLE_ENABLE:
-        logger.add(
-            sink=sys.stdout,
-            level=LOG_CONSOLE_LEVEL,
-            format=LOG_FORMAT,
-            colorize=True,
-            enqueue=True
-        )
-
-    # 3. 配置文件输出（若.env开启）
-    if LOG_FILE_ENABLE:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        logger.add(
-            sink=LOG_FILE_PATH,
-            level=LOG_FILE_LEVEL,
-            format=LOG_FORMAT,
-            rotation="00:00",
-            retention=LOG_FILE_RETENTION,
-            encoding="utf-8",
-            enqueue=True,
-            backtrace=True,
-            diagnose=True
-        )
-
+    """显式且幂等地配置输出；复用统一环境解析，保留其他自定义 sink。"""
+    global _initialized
+    with _init_lock:
+        if _initialized:
+            return logger
+        console = env_bool("LOG_CONSOLE_ENABLE", True)
+        file_enabled = env_bool("LOG_FILE_ENABLE", True)
+        options = {"format": format_log_record, "backtrace": False, "diagnose": False}
+        try:
+            _logger.remove(0)  # 只替换 Loguru 自带的默认输出。
+        except ValueError:
+            pass
+        if console:
+            _sink_ids.append(logger.add(
+                sys.stdout, level=env_text("LOG_CONSOLE_LEVEL", "INFO"), colorize=True,
+                # 可仅关闭某段代码的控制台输出；内存/文件 sink 仍保留完整记录。
+                filter=lambda record: record["extra"].get("console_output", True) is not False,
+                **options,
+            ))
+        if file_enabled:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            _sink_ids.append(logger.add(
+                LOG_FILE_PATH, level=env_text("LOG_FILE_LEVEL", "INFO"),
+                encoding="utf-8", colorize=False, rotation="00:00",
+                retention=env_text("LOG_FILE_RETENTION", "7 days"), **options,
+            ))
+        _initialized = True
     return logger
 
-# -------------------------- 第六步：初始化并终极修正全局logger --------------------------
-base_logger = init_logger()
 
-def fix_log_position(record):
-    """遍历调用栈，跳过loguru内部帧+工具类自身帧，提取业务代码实际调用位置"""
-    for frame in inspect.stack():
-        # 终极过滤：排除loguru内部 + 排除工具类logger.py自身，直接定位业务模块
-        if ("_logger.py" in frame.filename or frame.function == "_log") or "logging.py" in frame.filename:
-            continue
-        # 更新日志字段为业务代码实际位置
-        record.update(
-            name=frame.filename.split("/")[-1].split("\\")[-1],
-            function=frame.function,
-            line=frame.lineno
-        )
-        break
-
-# 应用终极修复，导出全局可用的logger
-logger = base_logger.patch(fix_log_position)
+def trace_fields(value: Any) -> dict[str, str]:
+    """提取可安全记录的标识，供日志装饰器与统一执行边界共用。"""
+    if not isinstance(value, Mapping):
+        return {}
+    fields = {}
+    for key in ("task_id", "document_id", "request_id", "session_id", "conversation_id"):
+        item = value.get(key)
+        if isinstance(item, str) and item and len(item) <= 64 and item.isprintable():
+            fields[key] = item
+    return fields
 
 
-from functools import wraps
-import time
-from typing import Mapping
+def _failure_log(kind: str, name: str, exc: BaseException, started: float, trace_id: str) -> None:
+    elapsed = round((perf_counter() - started) * 1000, 3)
+    label = "节点" if kind == "node" else "步骤"
+    trace = f"，追踪ID={trace_id}" if kind == "node" else ""
+    if not isinstance(exc, Exception):
+        logger.bind(status="interrupted", duration_ms=elapsed).warning("[{}] {}被中断{}", name, label, trace)
+        return
+    code, message, _ = error_summary(exc)
+    # 保存原因链的栈帧位置，不展开局部变量/SDK 原始消息，避免 URI、密钥或正文泄漏。
+    stacks = []
+    current = exc
+    visited = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        stacks.append(type(current).__name__ + "\n" + "".join(traceback.format_tb(current.__traceback__)))
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    detail = "\n".join(stacks) if kind == "node" else type(exc).__name__
+    logger.bind(status="failed", duration_ms=elapsed).error(
+        "[{}] {}失败{}，code={} message={}\n{}", name, label, trace, code, message, detail,
+    )
 
-def _trace_id(state) -> str:
-    if isinstance(state, Mapping):
-        return str(state.get("session_id") or state.get("task_id") or "-")
-    return "-"
 
-def node_log(node_name: str):
-    def deco(func):
+def _execution_log(kind: str, name: str) -> Callable:
+    label = "节点" if kind == "node" else "步骤"
+
+    def decorate(func: Callable) -> Callable:
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                fields = trace_fields(args[0] if args else kwargs.get("state"))
+                with logger.contextualize(**fields, **{kind: name}):
+                    started = perf_counter()
+                    trace_id = fields.get("task_id") or fields.get("request_id") or fields.get("session_id") or "-"
+                    trace = f"，追踪ID={trace_id}" if kind == "node" else ""
+                    logger.bind(status="running").info("[{}] {}开始{}", name, label, trace)
+                    try:
+                        result = await func(*args, **kwargs)
+                    except BaseException as exc:
+                        _failure_log(kind, name, exc, started, trace_id)
+                        raise
+                    elapsed = round((perf_counter() - started) * 1000, 3)
+                    logger.bind(status="completed", duration_ms=elapsed).info(
+                        "[{}] {}完成{}，耗时={:.3f}ms", name, label, trace, elapsed,
+                    )
+                    return result
+            return async_wrapper
+
         @wraps(func)
-        def wrapper(state, *args, **kwargs):
-            trace_id = _trace_id(state)
-            start_ts = time.time()
-            logger.info(f"[{node_name}] 节点开始，追踪ID={trace_id}")
-            try:
-                result = func(state, *args, **kwargs)
-                cost_ms = int((time.time() - start_ts) * 1000)
-                logger.info(f"[{node_name}] 节点完成，追踪ID={trace_id}，耗时={cost_ms}ms")
+        def sync_wrapper(*args, **kwargs):
+            fields = trace_fields(args[0] if args else kwargs.get("state"))
+            with logger.contextualize(**fields, **{kind: name}):
+                started = perf_counter()
+                trace_id = fields.get("task_id") or fields.get("request_id") or fields.get("session_id") or "-"
+                trace = f"，追踪ID={trace_id}" if kind == "node" else ""
+                logger.bind(status="running").info("[{}] {}开始{}", name, label, trace)
+                try:
+                    result = func(*args, **kwargs)
+                except BaseException as exc:
+                    _failure_log(kind, name, exc, started, trace_id)
+                    raise
+                elapsed = round((perf_counter() - started) * 1000, 3)
+                logger.bind(status="completed", duration_ms=elapsed).info(
+                    "[{}] {}完成{}，耗时={:.3f}ms", name, label, trace, elapsed,
+                )
                 return result
-            except Exception:
-                logger.exception(f"[{node_name}] 节点异常，追踪ID={trace_id}")
-                raise
-        return wrapper
-    return deco
+        return sync_wrapper
+    return decorate
 
-def step_log(step_name: str):
-    """
-    步骤日志装饰器：
-    - 自动打印 步骤开始 / 步骤完成 / 步骤异常（含堆栈）
-    - 不吞异常，保持原有业务语义
-    """
-    def deco(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            start_ts = time.time()
-            logger.info(f"[{step_name}] 步骤开始")
-            try:
-                result = func(*args, **kwargs)
-                cost_ms = int((time.time() - start_ts) * 1000)
-                logger.info(f"[{step_name}] 步骤完成，耗时={cost_ms}ms")
-                return result
-            except Exception:
-                logger.exception(f"[{step_name}] 步骤异常")
-                raise
-        return wrapper
-    return deco
 
-# -------------------------- 测试代码（验证修复效果） --------------------------
-if __name__ == '__main__':
-    logger.info("【测试】logging.py内部调用（仅测试，业务模块调用会显示正确文件名）")
-    print(f"日志文件输出路径：{LOG_FILE_PATH}")
-    logger.error("【测试】logging.py内部调用（仅测试，业务模块调用会显示正确文件名）")
+def node_log(node_name: str) -> Callable:
+    """每个业务节点显式使用；标记供图绑定器检查，避免漏写或重复包装。"""
+    def decorate(func: Callable) -> Callable:
+        wrapped = _execution_log("node", node_name)(func)
+        wrapped.__node_log_name__ = node_name
+        return wrapped
+    return decorate
 
-    # 异常堆栈演示：logging.exception() 需要放在 except 代码块中
-    try:
-        # 伪代码：模拟业务异常（例如数据库查询、网络调用、文件解析等）
-        result = 10 / 0
-        logger.info(f"业务结果：{result}")
-    except Exception:
-        logger.exception("【测试】捕获到业务异常，输出完整堆栈信息")
+
+def step_log(step_name: str) -> Callable:
+    """观察同步/异步步骤，不吞异常，不把协程创建当成执行完成。"""
+    return _execution_log("step", step_name)

@@ -2,33 +2,27 @@
 
 面向教育培训场景，导入课程资料、项目文档、教学讲义和题库，提供课程查询、文档检索、题目检索与知识问答。
 
-> 本文是依据《需求说明.md》和已确认方案整理的架构与开发入口。节点和接口仍待实现；Milvus 已提供三套 Schema 定义，配置适配已通过离线测试，实际建表与服务集成尚未验证。
+> 本文介绍项目架构、存储结构和两个 LangGraph 流程。原始需求见 [需求说明.md](需求说明.md)；开发规则、工具待办与当前进度统一见 [节点开发交接.md](节点开发交接.md)。
 
-**新会话开发入口：[节点开发交接.md](节点开发交接.md)。** 其中包含当前已实现/未实现清单、真实数据位置、节点输入输出、状态与路由、旧工具适配事项、实现顺序及验收标准。接手开发时先读交接文档，再按本文查阅架构和集合字段。
-
-**公共模块检查：[common与utils检查清单.md](common与utils检查清单.md)。** 已逐项检查 common、utils 和提示词，列明必须修改、可以复用、暂不接入和需要新增的能力，并附优先级、源码位置与验收方式。配置模块及必要调用方已完成一轮离线适配，其余状态见清单第 6 节；开发节点前先落实对应待办。
-
-**节点实现写法：[节点编写规范与提示词.md](节点编写规范与提示词.md)。** 基于 shopkeeper-brain 的 14 个实际节点整理，包含原流程与源码定位、node/step 分工、工具调用、日志与异常、业务提示词草稿，以及可直接给开发 AI 的任务模板。草稿尚未写入业务提示词文件。
-
-当前 `.env` 已配置三个教育集合名称；导入 State/图骨架已编写、待用户审核，查询图、全部业务节点及 API 入口尚未实现。现有工具来自参考项目，不能把工具文件存在等同于业务已完成；首次数据库建表和真实数据导入也尚未执行。
+当前导入仅实现 `entry`（1/9，待审核），查询节点 0/11；完整流程、API 和真实服务联调尚未完成。Schema 已定义，不代表已经在数据库建表。
 
 ## 0. 接手顺序与当前进度
 
-新会话依次阅读：本文 → [节点开发交接.md](节点开发交接.md) → [节点编写规范与提示词.md](节点编写规范与提示词.md) → [common与utils检查清单.md](common与utils检查清单.md)，再按需核对 [需求说明.md](需求说明.md) 和源码。本文说明做什么，交接文档规定输入输出与路由，编写规范说明参考节点的函数/日志/提示词写法，检查清单说明工具现状与待办；完成状态必须以实际代码和验证结果为依据。
+新会话先读本文了解架构，再读 [节点开发交接.md](节点开发交接.md) 按当前进度开发；业务需求以 [需求说明.md](需求说明.md) 为准。文档只记录当前结论，不保留已被替代的实施方案。
 
 | 工作项 | 当前状态 | 证据与下一步 |
 | --- | --- | --- |
 | 需求、数据样本、技术分层 | 已确认 | 教育业务；LangGraph 两个图；三类向量集合；系列/子课程分层 |
 | Milvus Schema | 定义已完成，服务端未验证 | 三套 Schema 和索引函数存在；不代表集合已经创建 |
 | 配置与必要调用方 | 离线适配完成 | 本次复核 18 个 test.test_config 测试全部通过；保留已有修复，不重新照旧问题清单覆盖 |
-| 公共工具改造 | 部分完成 | 字符串主键、RRF 与配置调用已适配；异步日志、任务、SSE、历史、错误语义等仍待改 |
+| 公共工具改造 | 部分完成 | 配置、异步日志及 entry 所需执行包装/内存任务适配已离线验证；SSE、历史及其他存储错误语义仍待改 |
 | 共享业务模型、解析器、构建器、业务仓储 | 待开发 | 先实现可离线验证的公共模型与真实 MD 规则解析 |
-| 导入图 / 查询图 | 导入骨架修改后待审核；业务节点均未实现 | 初值、映射、路由自检及真实 compile/ASCII 画图通过（仅结构预览）；导入 0/9、查询 0/11 |
+| 导入图 / 查询图 | 原骨架已审核；本轮 State/Schema/entry 调整待复审 | 导入 1/9（entry），查询 0/11；当前 5 个简明自测案例通过；历史版本曾验证单节点图接入，未跑完整导入流程 |
 | API / 前端 / 真实服务联调 | 待开发或待验证 | API 入口尚不存在；模型推理、数据库、对象存储集成不能标记已通过 |
 
-**工具优先复用是开发约定：先检索 common/utils，再决定调用、修复、扩展或新增。节点主要保留业务判断、流程组织与状态更新；不得在节点中重复创建客户端、解析配置或复制已有工具逻辑。确需新增公共方法时，必须说明现有工具为什么不适用。** 专属单节点的简单业务逻辑可留在节点内，不要求把所有函数改成类。
+**节点开发只改当前节点和必要 common/prompt 提示词：先检索并调用现有 common/utils，不自动修改配置、日志、Schema 或已有工具；发现缺口先反馈并单独取得授权。节点不重复创建客户端、读取配置或复制已有工具实现。** 专属单节点的简单业务逻辑可留在节点内，不要求把所有函数改成类。
 
-**当前停在导入流程 state.py 和 main_graph.py 两份一起待用户审核的阶段，明确通过后才能开发节点。** 每次只完成一个节点及其必要工具适配，验证后交用户审核，通过后才能继续下一个。检索流程开始时同样先交 state.py/main_graph.py。代码需有必要注释；单节点自测放在本节点的 `if __name__ == "__main__":` 中，完整流程测试在该流程完成后放入 test/。详细规则见交接文档第 8 节。直接修改工作区源文件，不初始化 Git 或创建分支。
+**导入 state.py/main_graph.py 已由用户明确审核通过；本轮仅交付 entry 及必需公共能力，停下等待 entry 审核。** 每次只完成一个节点及必要 common/prompt 提示词，冻结配置与公共工具，验证后交用户审核，通过后才能继续下一个。检索流程开始时同样先交 state.py/main_graph.py。单节点自测放在本节点的 `if __name__ == "__main__":` 中，完整流程测试在该流程完成后放入 test/。详细规则见交接文档第 2 节。直接修改源文件，不初始化 Git 或创建分支。
 
 ## 1. 总体架构与本期范围
 
@@ -51,12 +45,12 @@
 | --- | --- |
 | FastAPI | 参数校验、上传、任务查询、问答接口、SSE 事件输出 |
 | LangGraph | 流程状态、节点调用、条件路由、错误分支 |
-| MongoDB | 课程目录、题目原始结构、文档与内容记录、任务状态、会话历史 |
-| Milvus | 内容的稠密/稀疏向量、检索过滤字段、关联内容记录的 ID |
-| MinIO | 原始文件、解析产物；数据库保存对象键和来源定位信息 |
+| MongoDB | 只保存按 session_id 关联的聊天历史；不保存导入任务、课程或题目 |
+| Milvus | 完整课程/题目/文档片段、过滤字段、1024 维稠密及稀疏向量 |
+| MinIO | 原文件、图片、超长完整记录 JSON、导入成功清单；Milvus 保存对象键 |
 | Embedding / Reranker / LLM | 向量化、相关性重排、意图与信息抽取、基于证据回答 |
 
-MongoDB 保存可返回给用户的完整结构；Milvus 负责召回，检索后按 ID 读取原记录，避免向量库成为题目和课程详情的唯一数据源。
+Milvus 同一行同时保存完整业务内容与检索向量。content 是参与向量化的检索文本，record_payload 保存未经摘要/截断的完整课程或题目；超过 JSON 预算则保存 MinIO JSON 对象键。任务进度只在 utils/task_utils 的单进程内存中管理，服务重启后丢失。MongoDB 只保存会话消息。
 
 ## 2. 内容模型与来源信息
 
@@ -94,7 +88,7 @@ MongoDB 保存可返回给用户的完整结构；Milvus 负责召回，检索�
 
 ### 2.3 Milvus 三集合结构
 
-按照实际数据和查询方式，采用三个独立集合。课程文档和项目文档共用文档切片集合；每个集合均包含 BGE-M3 的 1024 维稠密向量与模型生成的稀疏向量。完整课程层级、完整题目结构仍由 MongoDB 保存。
+按照实际数据和查询方式，采用三个独立集合。课程文档和项目文档共用文档切片集合；每个集合均包含 BGE-M3 的 1024 维稠密向量与模型生成的稀疏向量。完整课程层级、题干/选项/答案/解析存入 record_payload；普通长度一条记录对应一个向量片段。
 
 | 集合 | 环境变量 | 一行的含义 | 主要检索 |
 | --- | --- | --- | --- |
@@ -106,14 +100,17 @@ Schema 定义位于 [common/schemas/milvus_schema.py](common/schemas/milvus_sche
 
 #### 三个集合的共有字段
 
-下表 15 个字段由三个集合共同使用。`VARCHAR(n)` 限制按 UTF-8 字节计算；这些字段由入库节点显式提供，字符串必填字段不能传空值。
+下表 18 个字段由三个集合共同使用。`VARCHAR(n)` 限制按 UTF-8 字节计算；这些字段由入库节点显式提供，必填标识和检索文本不能传空值；payload_object_key 仅超长外置时填写，普通记录传空串。
 
 | 字段 | Milvus 类型 | 用途 / 约束 |
 | --- | --- | --- |
 | `chunk_id` | `VARCHAR(64)`，主键 | 由任务、记录、片段顺序生成稳定 UUID；同一任务重试复用 |
-| `record_id` | `VARCHAR(64)` | MongoDB 完整内容记录 ID，一条记录可以对应多个检索片段 |
+| `record_id` | `VARCHAR(64)` | 完整业务记录 ID，一条记录可以对应多个检索片段 |
 | `document_id` | `VARCHAR(64)` | 原始文档 ID |
-| `task_id` | `VARCHAR(64)` | 导入任务 ID，用于成功状态核验和失败清理 |
+| `task_id` | `VARCHAR(64)` | 导入任务 ID，用于成功清单核验和按任务清理 |
+| `import_manifest_key` | `VARCHAR(2048)` | MinIO 导入成功清单对象键，查询必须校验 |
+| `payload_object_key` | `VARCHAR(2048)` | 超长完整记录的 MinIO JSON 对象键，普通记录传空串 |
+| `record_payload` | `JSON` | 完整业务记录（包括元数据与 payload）；超长外置时传 {} |
 | `chunk_index` | `INT32` | 片段在完整记录内的顺序，从 0 开始 |
 | `content` | `VARCHAR(65535)` | 实际送入 Embedding 的检索文本；超长时重新切分，不能静默截断 |
 | `knowledge_points` | `ARRAY<VARCHAR(256)>`，最多 64 项 | 规范化知识点标签，未知传 `[]` |
@@ -139,11 +136,11 @@ BGE-M3 的向量规格参见 [模型官方说明](https://huggingface.co/BAAI/bg
 | `course_id` | `VARCHAR(128)` | 子课程行必填；系列行为空串 | 未确定子课程时默认空串 |
 | `course_name` | `VARCHAR(512)` | 子课程行必填；系列行为空串 | 未确定子课程时默认空串 |
 
-子课程与系列的对应关系由 MongoDB 管理。一个题库可能关联多个系列或子课程，不能仅凭相近名称自动挂到某一门课；多对多关系在 MongoDB 保存，查询时解析成受控的题库/记录过滤条件。向量行上的课程归属仅保存已明确的单一归属。
+系列/子课程及已确认的题库/项目关系保存在 record_payload.metadata/payload；需要按关系先标量查询对应集合，再构造受控过滤条件，不做数据库 join。未知关系留空，不凭相近名称挂课；常用单一归属同时投影至标量字段以便检索过滤。
 
 #### 课程集合 education_courses
 
-共有 26 个字段：15 个共有字段 + 4 个课程归属字段 + 以下 7 个字段。
+共有 29 个字段：18 个共有字段 + 4 个课程归属字段 + 以下 7 个字段。
 
 | 专属字段 | 类型 | 含义 |
 | --- | --- | --- |
@@ -159,7 +156,7 @@ BGE-M3 的向量规格参见 [模型官方说明](https://huggingface.co/BAAI/bg
 
 #### 文档集合 education_document_chunks
 
-共有 26 个字段：15 个共有字段 + 4 个课程归属字段 + 以下 7 个字段。
+共有 29 个字段：18 个共有字段 + 4 个课程归属字段 + 以下 7 个字段。
 
 | 专属字段 | 类型 | 含义 |
 | --- | --- | --- |
@@ -172,7 +169,7 @@ BGE-M3 的向量规格参见 [模型官方说明](https://huggingface.co/BAAI/bg
 
 #### 题目集合 education_questions
 
-共有 24 个字段：15 个共有字段 + 4 个课程归属字段 + 以下 5 个字段，均默认空串。
+共有 27 个字段：18 个共有字段 + 4 个课程归属字段 + 以下 5 个字段，均默认空串。
 
 | 专属字段 | 类型 | 含义 |
 | --- | --- | --- |
@@ -184,7 +181,7 @@ BGE-M3 的向量规格参见 [模型官方说明](https://huggingface.co/BAAI/bg
 
 题型编码在 Schema 模块的 `QUESTION_TYPE_LABELS` 中统一维护，覆盖实际样本中的单选、多选、判断、简答、编程、计算、证明、公式推导、案例分析、材料分析、情境分析、数据分析、翻译、完形填空、阅读理解，并预留填空和 `other`。无法识别的新题型使用 `other`，同时保留原始名称；题型本身缺失时两字段均留空。
 
-`题目资料.md` 按二级标题建立题库、三级标题读取原题编码，按固定标签解析题型、题干、选项、答案和解析。一道题作为完整记录，普通长度只生成一个片段；超长题目允许多个关联片段，返回时按 `record_id` 合并。向量文本以题干、选项和知识点为主，完整答案与解析从 MongoDB 读取。
+`题目资料.md` 按二级标题建立题库、三级标题读取原题编码，按固定标签解析题型、题干、选项、答案和解析。一道题作为完整记录，普通长度只生成一个片段；超长题目允许多个关联片段，返回时按 `record_id` 合并。向量文本以题干、选项和知识点为主，完整题目从 record_payload.payload 读取，至少保留 stem、options、answer、explanation 和原题型；不能从向量文本或 LLM 还原标准答案。
 
 #### 索引和检索路由
 
@@ -200,7 +197,7 @@ BGE-M3 的向量规格参见 [模型官方说明](https://huggingface.co/BAAI/bg
 
 查询图按主意图选集合：课程查询进入课程集合，文档定位进入文档集合，查题进入题目集合。综合知识问答按需要搜索多个集合：每个集合内部先做稠密/稀疏混合召回，search_knowledge 保留各来源候选和排名；跨集合 RRF 集中在 rerank 阶段的公共工具中执行一次，再按 `record_id` 去重并重排，不直接比较不同来源的原始相似度分数。Milvus 一次 `hybrid_search` 对一个集合执行，跨集合编排由业务层完成。
 
-所有分支都验证 MongoDB 中来源任务已成功；失败、未完成任务的内容不可用于回答。任务内重试使用稳定 `chunk_id` 和 upsert，不同任务不覆盖同一主键。三个集合共用的来源定位字段分别使用 MD 行号、PDF 页码、DOCX 段落/标题；转换后页码须标注 `locator_basis: "converted_pdf"` 并保存转换对象键，不能冒充原始 Word 页码。
+所有分支（包括按题号/课程 ID 精确查询）都验证 MinIO 成功清单；缺少或未成功发布的来源不可用于回答，不依赖进程内任务是否存在。任务内重试使用稳定 `chunk_id` 和 upsert，不同任务不覆盖同一主键。三个集合共用的来源定位字段分别使用 MD 行号、PDF 页码、DOCX 段落/标题；转换后页码须标注 `locator_basis: "converted_pdf"` 并保存转换对象键，不能冒充原始 Word 页码。
 
 字段和索引规则参照 [Milvus Schema 文档](https://milvus.io/docs/schema.md) 与 [稀疏向量文档](https://milvus.io/docs/v2.6.x/sparse_vector.md)。
 
@@ -242,6 +239,17 @@ for name, schema_builder, index_builder in specs:
 ```
 
 现有 Milvus 工具默认返回三个集合的共有字段，按字符串主键读取，单集合混合检索默认采用 RRF。跨集合召回、来源任务校验与完整记录读取仍需在后续查询节点中实现。
+
+#### 完整内容与发布合同
+
+- 三个集合仍为课程、文档、题目，不新增任务或聊天集合。
+- record_payload 保存完整 ContentRecord：record_id/task_id/document_id/content_type/content/metadata/payload/source。课程 payload 保留详情和已确认关系；题目 payload 保留原题、选项、答案、解析。
+- Milvus content 只负责向量化与重排，不能替代完整记录；查询时使用同模型生成查询向量，精确查题可直接标量过滤。
+- JSON 单字段上限 65,536 字节。MAX_INLINE_PAYLOAD_BYTES=60000 为保守预算，构建器按序列化结果校验；超限时将完整记录保存为 MinIO JSON，record_payload={} 且 payload_object_key 非空，不静默截断。小记录 payload_object_key=""。大对象读取失败必须显式报错。
+- 多个检索片段共享 record_id，完整 payload/对象键保持一致；返回按 record_id 去重，不能靠拼接召回片段恢复原题。
+- save_file 产生稳定 import_manifest_key；finish 在全部写入和校验成功后写成功清单（task_id/document_id/status=succeeded/三集合实写明细和版本）。此前不得创建成功清单。
+- handle_error 只清理本调用已领取任务的未发布产物；entry 返回 task_claimed=True 才表示拥有清理资格。并发重复启动失败不能删除另一调用的内容。
+- Schema 目前只是本地定义。若服务上已有旧集合，首次接入须比对字段后制定迁移；本轮不自动删除重建或修改真实服务。
 
 ### 2.4 实际样本与设计依据
 
@@ -290,7 +298,7 @@ flowchart TD
 | `extract_metadata` / `node_extract_metadata.py` | 合并上传信息和原文信息，识别内容类型、课程、项目、章节、题库等归属 | `document_metadata`、`typed_blocks`、`warnings` |
 | `build_records` / `node_build_records.py` | 根据内容类型调用对应构建器，校验必填项，生成完整记录与检索文本 | `records`、`chunks`、`rejected_records`、`counts` |
 | `embedding` / `node_embedding.py` | 批量生成稠密/稀疏向量，记录使用的模型标识；入库与查询使用相同模型和维度 | `embedded_records` |
-| `persist` / `node_persist.py` | 按内容类型写入三个 Milvus 集合及对应 MongoDB 完整记录；幂等写入并分别统计数量，供校验和失败清理 | `persist_result` |
+| `persist` / `node_persist.py` | 按内容类型把完整 record_payload 与向量一起 upsert 到三个 Milvus 集合；超长记录保留 MinIO JSON，记录明细供校验及失败清理 | `persist_result` |
 | `finish` / `node_finish.py` | 校验写入数量，确认至少有一条有效内容；将任务置为 `succeeded`，返回统计和警告 | `result`、`status` |
 | `handle_error` / `node_handle_error.py` | 记录失败节点与原因，将任务置为 `failed`；尽力清理本任务写入内容并保留排查信息 | `error`、`status` |
 
@@ -317,15 +325,15 @@ flowchart TD
 
 实现入口为 `create_initial_state(task_id=..., document_id=..., file_path=..., upload_metadata=...)`：每次创建独立容器并深拷贝上传元数据；初始为 pending、空 current_node、source_file/error 为 None，其余产物为空、计数为 0。轻量内容类型暂定义在 state.py，后续随节点迁入 common/schemas，保持单一定义。
 
-`build_import_graph(nodes, deps=..., bind_node=...)` 强制注入全部九个节点及统一执行绑定器；缺失/未知/不可调用节点明确报错。普通节点（含 finish）只用条件边，error 非 None 或状态 failed 时进入 handle_error，其余走正常后继；handle_error 直接 END。公共绑定器须负责 await、异常转 NodeError、阶段和日志，目前只有接口合同，尚无实现。骨架不包含默认节点或自动编译的全局图。
+`build_import_graph(nodes, deps=..., bind_node=...)` 强制注入全部九个节点及统一执行绑定器；缺失/未知/不可调用节点明确报错。普通节点（含 finish）只用条件边，error 非 None 或状态 failed 时进入 handle_error，其余走正常后继；handle_error 直接 END。公共绑定器已在 `utils/node_execution.py` 实现，当前仅 entry 已接入验证；其余节点未实现，不能运行完整导入图。骨架不包含默认节点或自动编译的全局图。
 
 ### 3.4 任务状态与入库可见性
 
 任务状态为 `pending → running → succeeded / failed`，同时记录当前节点、各阶段数量、开始/结束时间和错误摘要；进度按阶段报告，不承诺虚假的精确百分比。
 
-接口先建立任务，再交给后台执行器运行导入图，立即返回 `task_id`。首版建议使用单进程、有并发上限的后台执行方式；这不提供持久队列保证。服务重启后将遗留的未完成任务标为失败，允许用户重新提交。
+Service 通过 get_task_store().create_pending(task_id, document_id) 创建内存任务，再调用图；任务查询读取同一实例的深拷贝快照。node_progress 及 running_nodes/completed_nodes/failed_nodes 展示运行/完成/失败节点。仅支持单进程；重启后旧 task_id 查询报不存在，不假装恢复旧进度。
 
-MongoDB 与 Milvus 的写入不具备跨库事务保证，因此内容携带 `task_id`。只有任务最终成功的内容才能用于检索；每个检索分支都验证来源任务状态。候选不足时按上限补充召回，不能仅在返回前删掉失败任务记录就停止检索。
+任务进度不是内容的发布凭据。persist 写入三个集合后，finish 校验实际条数/ID，最后写入 MinIO 任务成功清单。所有检索分支通过公共工具核验清单的 task_id/document_id/记录关联，再返回内容；没有清单的残留内容不可见。清单不存在与 MinIO 服务异常必须区分。成功清单是发布提交点，已提交后不能仅因内存进度更新失败而删除内容。
 
 单条坏数据可跳过并记入拒绝明细，有效内容成功入库后任务为 `succeeded` 且附带警告；没有有效内容或基础设施写入失败则为 `failed`。同一任务内部重试使用稳定记录 ID 和 upsert，避免重复写入；不同任务的重复文件去重策略待审查，暂不等同于增量更新。
 
@@ -359,14 +367,14 @@ flowchart TD
 
 | 节点 / 拟定文件 | 主要处理内容 | 输出状态 |
 | --- | --- | --- |
-| `entry` / `node_entry.py` | 校验问题、会话标识、请求标识及返回条数等参数 | `request_id`、`conversation_id`、`question` |
+| `entry` / `node_entry.py` | 校验问题、会话标识、请求标识及返回条数等参数 | `request_id`、`session_id`、`question` |
 | `load_context` / `node_load_context.py` | 从 MongoDB 加载有长度限制的近期对话；新会话使用空历史 | `history` |
 | `analyze_query` / `node_analyze_query.py` | 将“这门课”等追问补成独立问题；识别主意图，提取课程系列、子课程、项目、章节、题库、题型、题目编码和知识点条件；解析名称对应的 ID | `standalone_question`、`intent`、`filters`、`clarification` |
 | `search_courses` / `node_search_courses.py` | 检索课程集合，区分系列与子课程；按 ID/名称读取完整目录与详情，支持知识点筛选、去重和分页 | `candidates`、`retrieval_info` |
 | `search_documents` / `node_search_documents.py` | 对文档切片集合执行带课程、项目和章节过滤的混合召回 | `candidates`、`retrieval_info` |
 | `search_questions` / `node_search_questions.py` | 优先按题库及题目编码精确查询；对题目集合按课程、题库、题型过滤并按知识点召回 | `candidates`、`retrieval_info` |
 | `search_knowledge` / `node_search_knowledge.py` | 按问题需要检索文档、课程、题目集合；复用检索工具收集候选，保留各来源排名，不重复执行跨集合融合 | `candidates`、`retrieval_info` |
-| `rerank` / `node_rerank.py` | 验证任务成功状态，读取完整记录；集中执行一次跨集合 RRF、去重与按需重排，保留来源；限制上下文长度并判断证据是否充足 | `selected_records`、`references`、`evidence_status` |
+| `rerank` / `node_rerank.py` | 验证成功清单，读取 record_payload 或超长 JSON；集中执行一次跨集合 RRF、去重与按需重排，保留来源；限制上下文长度并判断证据是否充足 | `selected_records`、`references`、`evidence_status` |
 | `answer_output` / `node_answer_output.py` | 根据意图选择结构化返回、带引用回答、无结果提示或澄清问题；需要生成时流式输出 | `answer`、`structured_result`、`references`、`result_status` |
 | `finish` / `node_finish.py` | 保存本轮问题、最终回答、结果引用和请求状态；组织最终响应 | `result` |
 | `handle_error` / `node_handle_error.py` | 记录错误、已输出的部分内容和失败状态；通过接口层报告失败 | `error`、`result_status` |
@@ -399,12 +407,12 @@ flowchart TD
 
 | 字段组 | 字段 |
 | --- | --- |
-| 输入与会话 | `request_id`、`conversation_id`、`question`、`history`、`limit`、`cursor` |
+| 输入与会话 | `request_id`、`session_id`、`question`、`history`、`limit`、`cursor` |
 | 问题理解 | `standalone_question`、`intent`、`filters`、`clarification` |
 | 检索证据 | `candidates`、`retrieval_info`、`selected_records`、`references`、`evidence_status` |
 | 输出与状态 | `answer`、`structured_result`、`result_status`、`warnings`、`error`、`result` |
 
-本期用 MongoDB 显式保存会话与消息，不将“保存聊天历史”等同于 LangGraph checkpoint。首版不承诺图执行断点恢复；以后确有需求再配置持久 checkpointer。
+本期仅用 MongoDB 的 chat_message 集合按 session_id 保存消息，会话列表由消息聚合，不将“保存聊天历史”等同于 LangGraph checkpoint。首版不承诺图执行断点恢复；以后确有需求再配置持久 checkpointer。
 
 ## 5. API 与流式交互约定
 
@@ -417,10 +425,10 @@ flowchart TD
 | `POST /api/query` | 非流式检索或问答，返回结构化结果、回答及引用 |
 | `POST /api/query/stream` | 使用同一查询图，通过 SSE 流式返回；前端使用支持 POST 流的 fetch 客户端 |
 | `GET /api/conversations` | 分页查看会话列表 |
-| `GET /api/conversations/{conversation_id}/messages` | 分页读取会话消息及引用 |
-| `DELETE /api/conversations/{conversation_id}` | 删除会话及消息，不影响知识库内容 |
+| `GET /api/conversations/{session_id}/messages` | 分页读取会话消息及引用 |
+| `DELETE /api/conversations/{session_id}` | 删除会话及消息，不影响知识库内容 |
 
-查询统一返回 `request_id`、`conversation_id`、`intent`、`status`、`answer`、`items`、`references` 和分页信息。无结果、证据不足、待澄清是正常业务状态，与基础设施执行失败区分。
+查询统一返回 `request_id`、`session_id`、`intent`、`status`、`answer`、`items`、`references` 和分页信息。无结果、证据不足、待澄清是正常业务状态，与基础设施执行失败区分。
 
 SSE 拟定事件：`meta`（请求与会话标识）、`progress`（阶段）、`token`（回答增量）、`result`（完整结果及引用）、`error`（失败摘要）、`done`（本次请求结束及最终状态）。精确查询可以没有 `token` 事件；`done` 每个请求最多一次，正常情况下在历史保存后发送。HTTP 流已经建立后的业务错误用事件传递，未建立流时使用正常 HTTP 错误响应。
 
@@ -480,7 +488,7 @@ utils/
 ├── task_utils.py                   # 任务阶段、数量和状态更新
 └── sse_utils.py                    # SSE 事件编码
 page/                               # 资料导入、任务进度和问答页面
-test/                               # 节点、路由与端到端验证
+test/                               # 现有配置测试；流程完成后增加完整流程测试
 logs/                               # 本地运行日志
 ```
 
@@ -495,7 +503,7 @@ logs/                               # 本地运行日志
 - 日志记录任务/请求标识、节点耗时、召回与写入数量及错误；不记录密钥，不把完整历史和原文件正文无差别输出到日志。
 - 导入图和查询图在服务初始化时编译复用，每次请求提供独立状态；后台任务状态、聊天记录和图的内部状态分别管理。
 
-日志与进度统一接入节点执行包装层：绑定 flow/task_id/request_id/conversation_id → 节点开始 → 阶段更新 → 执行业务 → 记录耗时/数量/警告 → 更新进度。node_log 记录节点生命周期，step_log 记录内部步骤；两者需先修复异步支持。错误包装器负责 error 状态与失败路由，日志装饰器本身不等于 LangGraph 异常路由。日志、MongoDB 持久任务状态和 SSE 是三个出口，共享上下文但不能互相代替，具体指标见交接文档第 4.4 节。
+每个业务节点显式声明 @node_log("node_xxx")，主函数第一步调用 add_running_task，中间调用带 @step_log 的业务步骤，最后调用 add_done_task 后返回增量。node_log/step_log 自动记录生命周期与耗时；节点不手写成串步骤日志。bind_node 负责依赖绑定、装饰器/返回检查、异常转 State 与失败进度，不自动登记运行/完成。条件边负责失败路由，日志装饰器本身不等于 LangGraph 异常路由。日志、内存任务进度和 SSE 是三个出口，不能互相代替，详见 [节点开发交接.md](节点开发交接.md) 第 3～4 节。
 
 LangGraph 的节点、共享状态和边的设计参照 [Graph API 官方文档](https://docs.langchain.com/oss/python/langgraph/graph-api)。流式实现参照 [Streaming 官方文档](https://docs.langchain.com/oss/python/langgraph/streaming)，编码时以当前锁文件实际安装的版本为准，不直接依赖更新版本才提供的接口。
 
@@ -511,20 +519,10 @@ LangGraph 的节点、共享状态和边的设计参照 [Graph API 官方文档]
 | 多轮与历史管理 | 支持“这门课”等上下文追问；会话可读取和删除，失败或中断有状态 |
 | 流式输出 | 能及时收到阶段与回答增量，最终拿到完整结果和引用，结束状态明确 |
 
-## 9. 节点开发交接与后续实施
+## 9. 开发顺序
 
-已确定采用 LangGraph 的文件导入图、问题检索图，以及课程、文档、题目三个 Milvus 集合。课程区分系列与子课程，支持 MD、PDF、DOCX，旧版 DOC 需要额外适配。具体节点输入输出与数据对象统一以 [节点开发交接.md](节点开发交接.md) 的实现合同为准，字段结构以 `common/schemas/milvus_schema.py` 为准。
+导入 State/图审核 → 导入节点逐个审核 → 导入流程测试 → 查询 State/图审核 → 查询节点逐个审核 → 查询流程测试 → API 与流式接入。
 
-后续按“导入 State/图审核 → 导入节点逐个审核 → 导入流程测试 → 查询 State/图审核 → 查询节点逐个审核 → 查询流程测试 → API 与流式”实施。共享模型及解析、日志、存储等工具随当前审核单元按需补齐，不提前实现后续节点。当前真实 Markdown 样本的解析基线为 219 个系列、657 个子课程、73 个题库、1752 道题；测试不得把这些数量硬编码成解析规则。
+当前停在 `entry` 审核；用户明确通过后才开发 `save_file`。每个节点显式使用 `@node_log`，主函数首步 `add_running_task`、中间调用带 `@step_log` 的业务步骤、末步 `add_done_task`，失败不标记完成。单节点自测写在本文件 `__main__`，保持简短并有必要断言。
 
-实现时默认沿用 MongoDB + Milvus + MinIO，并使用现有 `.env` 服务配置。首版后台任务采用单进程、有限并发；资料归属不能确认时留空并记录警告；题目标准答案以来源资料为准。解析器的具体选择、PDF/OCR 样例验证、题库/课程关联规则在对应模块实现时说明，不把这些常规实现选择误当成架构尚未确定而重复停下来确认。
-
-需要特别适配的旧代码包括：任务状态 processing/completed、仅内存任务追踪、SSE 的 ready/delta/final 事件名、按 session_id 隔离的队列、商品 item_names 历史字段、导入时尝试连接 MongoDB 的副作用，以及仅提供文档编码的 Embedding 工具。异步日志装饰器、历史顺序、失败被当成空结果等问题仍待改造；温度 0、模型来源和设备传参等配置调用问题已经修复并离线验证。逐文件证据、修改目标及验收要求见 [common与utils检查清单.md](common与utils检查清单.md)，业务仓储职责见交接文档第 7 节。
-
-2026-10-19 已统一 common/config 的 .env 加载、默认值、类型/布尔解析与延迟必填校验，新增 MongoDB 配置，修复温度 0、BGE_M3 和 Reranker 设备传参；占位说明见 `.env.example`。18 个配置/调用方离线测试及 common/utils/test 的 38 个 Python 文件语法检查通过，真实 `.env` 未修改。未新增业务节点、连接真实服务、创建集合或下载模型。WinError 10106 仍可在 asyncio 相关导入时重现，实际服务与模型集成尚未验证；common/utils 其余教育项目适配待办见检查清单第 6 节。
-
-2026-10-19 导入骨架交审：新增 `processor/import_processor/state.py`、`main_graph.py`；两个文件的 `__main__` 合同自检、原 18 个配置测试及全项目 46 个 Python 文件 AST 检查通过。锁文件/本地 LangGraph 均为 1.2.5，真实导入仍在 asyncio/_overlapped 处触发 WinError 10106，因此未验证实际 compile、依赖绑定执行或业务链。未新增节点、公共执行器或流程测试。当前待用户审核，未获明确通过前停止后续开发。
-
-2026-10-19 按用户反馈修订：main_graph.py 改为逐项 add_node、逐项添加条件边，去掉泛型/Protocol；测试入口使用真实 LangGraph 编译后调用 `get_graph().print_ascii()`，可直接看到包含错误分支的图。预览函数只在 __main__ 中定义，执行即抛 NotImplementedError；不调用 invoke/ainvoke，不代表业务已实现。state.py 本轮未改动。
-
-运行：`.venv/Scripts/python.exe -X utf8 -m processor.import_processor.main_graph`。本次定位 WinError 10106 为当前工具进程缺少 SystemRoot；仅在验证命令中设置 `$env:SystemRoot = 'C:\Windows'` 后，真实导入、编译、依赖绑定和全部 18 条边的结构断言及 ASCII 画图通过，未修改系统环境设置。两份自检、18 项配置测试和 46 文件 AST 复核通过。公共执行器、业务节点与真实服务仍未实现/验证，本轮交审后停止。
+后续只更新 [节点开发交接.md](节点开发交接.md) 的当前进度和待办，不再新增重复规范、检查清单或历史变更记录。节点开发默认仅改当前节点、必要 `common/prompt` 和文档；配置、已有工具及已审核 State/图冻结，缺口先反馈。

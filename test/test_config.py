@@ -215,9 +215,11 @@ class ConfigBoundaryTests(OfflineTest):
             config.validate()
             self.assertEqual(config.db_name, "education")
             self.assertEqual(config.chat_message_collection, "chat_message")
+            self.assertFalse(hasattr(config, "import_tasks_collection"))
+            self.assertFalse(hasattr(config, "content_records_collection"))
         for values in ({"MONGO_DB_NAME": "bad/name"}, {"MONGO_URL": "http://localhost"},
                        {"MONGO_URL": "mongodb+srv://host:27017"},
-                       {"MONGO_DOCUMENTS_COLLECTION": "import_tasks"}, {"MONGO_DOCUMENTS_COLLECTION": "system.x"}):
+                       {"MONGO_CHAT_MESSAGE_COLLECTION": "system.x"}, {"MONGO_CHAT_MESSAGE_COLLECTION": "bad$name"}):
             env = {"MONGO_URL": "mongodb://localhost:27017", "MONGO_DB_NAME": "education", **values}
             with self.subTest(values=values), self.assertRaises(_env.ConfigError):
                 MongoConfig.from_env(env).validate()
