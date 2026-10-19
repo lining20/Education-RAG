@@ -1,0 +1,216 @@
+"""导入图的数据合同与初始状态；不创建任务、客户端或模型。
+
+本轮限定只交 State/图，因此必要的轻量 TypedDict 暂放本文件。后续节点
+需要共享这些对象时，再迁至 common/schemas 并保持单一定义，不复制两套。
+TypedDict 只提供类型提示；业务校验由对应节点及公共工具执行。
+"""
+
+from copy import deepcopy
+from typing import Any, Literal, TypedDict
+
+
+ImportStatus = Literal["pending", "running", "succeeded", "failed"]
+ImportNodeName = Literal[
+    "entry", "save_file", "parse_file", "extract_metadata", "build_records",
+    "embedding", "persist", "finish", "handle_error",
+]
+CollectionKey = Literal["courses", "document_chunks", "questions"]
+ContentType = Literal["course_intro", "document_chunk", "project_material", "question"]
+# 元数据、定位和业务 payload 的细节随对应节点完善；这里只允许可序列化数据，
+# 不放 SDK 对象、异常、文件句柄、队列或取消信号。Any 不代表免除节点校验。
+DataDict = dict[str, Any]
+
+
+class SourceFile(TypedDict):
+    """原文件归档信息；object_key 为持久对象键，不是临时签名链接。"""
+
+    document_id: str
+    file_name: str
+    object_key: str
+    format: Literal["md", "docx", "pdf"]
+    fingerprint: str
+
+
+class ParsedBlock(TypedDict):
+    """按阅读顺序排列的内容块；表格、代码、图片关联信息保留在 payload。"""
+
+    block_id: str
+    text: str
+    block_type: Literal["heading", "paragraph", "table", "code", "image_ref"]
+    heading_path: list[str]
+    source_locator: DataDict
+    payload: DataDict
+
+
+class ContentRecord(TypedDict):
+    """MongoDB 完整内容记录；payload 保存课程层级或完整题目等结构。"""
+
+    record_id: str
+    task_id: str
+    document_id: str
+    content_type: ContentType
+    content: str
+    metadata: DataDict
+    payload: DataDict
+    source: DataDict
+
+
+class ChunkDraft(TypedDict):
+    """fields 仅含目标集合的字段，不含向量；投影/长度校验仍待工具实现。"""
+
+    collection_key: CollectionKey
+    fields: DataDict
+
+
+class EmbeddedBatches(TypedDict):
+    """三集合的待 upsert 行；每行含向量，空集合使用 []。"""
+
+    courses: list[DataDict]
+    document_chunks: list[DataDict]
+    questions: list[DataDict]
+
+
+class NodeError(TypedDict):
+    """可序列化的原始错误摘要；不保存异常对象或完整堆栈。"""
+
+    node: ImportNodeName
+    code: str
+    message: str
+    retryable: bool
+
+
+class CollectionCounts(TypedDict):
+    courses: int
+    document_chunks: int
+    questions: int
+
+
+class RecordCounts(TypedDict):
+    # course_intro 按系列/子课程分开计数，二者合计才是课程完整记录数。
+    series: int
+    course: int
+    document_chunk: int
+    project_material: int
+    question: int
+
+
+class ImportCounts(TypedDict):
+    """累计统计；切片、向量与实际入库数量分别记录，不以计划数冒充实写数。"""
+
+    files: int  # entry 确认有效后置 1；本图一次只处理一个文件。
+    records: int
+    rejected_records: int
+    records_by_type: RecordCounts
+    chunks_by_collection: CollectionCounts
+    embedded_by_collection: CollectionCounts
+    persisted_records: int
+    persisted_by_collection: CollectionCounts
+
+
+class ImportState(TypedDict):
+    """一次导入任务的内存状态；使用 create_initial_state 创建完整初值。
+
+    节点只返回本次修改字段的增量字典，不原地改 State。当前串行图采用
+    默认覆盖语义，warnings/统计等需要返回更新后的完整字段值，不自动追加。
+    任务表只持久化统计和产物引用，不持久化整份 State 或全部向量。
+    """
+
+    # Service 已创建 pending 任务和临时文件；entry 再次校验，不在这里生成 ID。
+    task_id: str
+    document_id: str
+    file_path: str
+    upload_metadata: DataDict
+
+    source_file: SourceFile | None  # save_file 成功前为 None，不伪造归档信息。
+    parsed_blocks: list[ParsedBlock]
+    document_metadata: DataDict
+    typed_blocks: list[DataDict]
+    records: list[ContentRecord]
+    chunks: list[ChunkDraft]
+    embedded_records: EmbeddedBatches
+    # persist 负责填充实写 ID/数量明细；失败清理仍以 task_id 核对数据库残留，
+    # 不能假设抛异常前尚未提交到 State 的批次明细一定存在。
+    persist_result: DataDict
+    counts: ImportCounts
+    warnings: list[DataDict]
+    rejected_records: list[DataDict]
+
+    status: ImportStatus
+    current_node: ImportNodeName | Literal[""]  # 尚未执行任何节点时为空串。
+    error: NodeError | None  # 首个业务错误保留；清理错误另记 warnings/result。
+    result: DataDict  # finish/handle_error 组织；空字典不表示成功。
+
+
+def create_initial_state(
+    *, task_id: str, document_id: str, file_path: str,
+    upload_metadata: DataDict | None = None,
+) -> ImportState:
+    """创建独立初值，不做文件 I/O、任务落库或业务校验。
+
+    输入标识/路径不作静默修正，交 entry 校验；必填参数没有虚构默认值。
+    可选字符串未知用空串、数值未知用 None、数组/定位未知用 []/{} 的
+    业务约定由后续构建器保持。这里的计数 0 表示尚未处理，而非已成功。
+    """
+    return {
+        "task_id": task_id,
+        "document_id": document_id,
+        "file_path": file_path,
+        "upload_metadata": deepcopy(upload_metadata) if upload_metadata is not None else {},
+        "source_file": None,
+        "parsed_blocks": [],
+        "document_metadata": {},
+        "typed_blocks": [],
+        "records": [],
+        "chunks": [],
+        "embedded_records": {"courses": [], "document_chunks": [], "questions": []},
+        "persist_result": {},
+        "counts": {
+            "files": 0, "records": 0, "rejected_records": 0,
+            "records_by_type": {
+                "series": 0, "course": 0, "document_chunk": 0,
+                "project_material": 0, "question": 0,
+            },
+            "chunks_by_collection": {"courses": 0, "document_chunks": 0, "questions": 0},
+            "embedded_by_collection": {"courses": 0, "document_chunks": 0, "questions": 0},
+            "persisted_records": 0,
+            "persisted_by_collection": {"courses": 0, "document_chunks": 0, "questions": 0},
+        },
+        "warnings": [],
+        "rejected_records": [],
+        "status": "pending",
+        "current_node": "",
+        "error": None,
+        "result": {},
+    }
+
+
+if __name__ == "__main__":
+    # 仅验证状态合同，不冒充节点或完整流程测试。
+    metadata = {"course": {"tags": ["Python"]}}
+    first = create_initial_state(
+        task_id="task-1", document_id="doc-1", file_path="input.md",
+        upload_metadata=metadata,
+    )
+    second = create_initial_state(task_id="task-2", document_id="doc-2", file_path="other.md")
+    assert set(first) == set(ImportState.__annotations__)
+    assert first["status"] == "pending" and first["current_node"] == ""
+    assert first["source_file"] is None and first["error"] is None
+    assert first["counts"]["files"] == 0 and first["result"] == {}
+
+    # 同时覆盖跨任务、嵌套字段、各集合/各统计阶段以及调用方元数据的隔离。
+    for key, value in first.items():
+        if isinstance(value, (list, dict)):
+            assert value is not second[key], key
+    first["warnings"].append({"code": "SELF_CHECK"})
+    first["embedded_records"]["courses"].append({"chunk_id": "check-only"})
+    first["counts"]["chunks_by_collection"]["courses"] = 1
+    first["counts"]["records_by_type"]["series"] = 1
+    first["upload_metadata"]["course"]["tags"].append("RAG")
+    assert second["warnings"] == [] and second["embedded_records"]["courses"] == []
+    assert first["embedded_records"]["questions"] == []
+    assert second["counts"]["records_by_type"]["series"] == 0
+    assert second["counts"]["chunks_by_collection"]["courses"] == 0
+    assert first["counts"]["embedded_by_collection"]["courses"] == 0
+    assert first["counts"]["persisted_by_collection"]["courses"] == 0
+    assert metadata == {"course": {"tags": ["Python"]}}
+    print("ImportState 合同与初值隔离检查通过（未运行业务节点）。")

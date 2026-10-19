@@ -10,7 +10,7 @@
 
 **节点实现写法：[节点编写规范与提示词.md](节点编写规范与提示词.md)。** 基于 shopkeeper-brain 的 14 个实际节点整理，包含原流程与源码定位、node/step 分工、工具调用、日志与异常、业务提示词草稿，以及可直接给开发 AI 的任务模板。草稿尚未写入业务提示词文件。
 
-当前 `.env` 已配置三个教育集合名称；两个图、业务节点及 API 入口尚未实现。现有工具来自参考项目，不能把工具文件存在等同于业务已完成；首次数据库建表和真实数据导入也尚未执行。
+当前 `.env` 已配置三个教育集合名称；导入 State/图骨架已编写、待用户审核，查询图、全部业务节点及 API 入口尚未实现。现有工具来自参考项目，不能把工具文件存在等同于业务已完成；首次数据库建表和真实数据导入也尚未执行。
 
 ## 0. 接手顺序与当前进度
 
@@ -23,12 +23,12 @@
 | 配置与必要调用方 | 离线适配完成 | 本次复核 18 个 test.test_config 测试全部通过；保留已有修复，不重新照旧问题清单覆盖 |
 | 公共工具改造 | 部分完成 | 字符串主键、RRF 与配置调用已适配；异步日志、任务、SSE、历史、错误语义等仍待改 |
 | 共享业务模型、解析器、构建器、业务仓储 | 待开发 | 先实现可离线验证的公共模型与真实 MD 规则解析 |
-| 导入图 / 查询图 | 业务节点均未实现 | 导入 0/9、查询 0/11；state.py、main_graph.py 尚不存在 |
+| 导入图 / 查询图 | 导入骨架修改后待审核；业务节点均未实现 | 初值、映射、路由自检及真实 compile/ASCII 画图通过（仅结构预览）；导入 0/9、查询 0/11 |
 | API / 前端 / 真实服务联调 | 待开发或待验证 | API 入口尚不存在；模型推理、数据库、对象存储集成不能标记已通过 |
 
 **工具优先复用是开发约定：先检索 common/utils，再决定调用、修复、扩展或新增。节点主要保留业务判断、流程组织与状态更新；不得在节点中重复创建客户端、解析配置或复制已有工具逻辑。确需新增公共方法时，必须说明现有工具为什么不适用。** 专属单节点的简单业务逻辑可留在节点内，不要求把所有函数改成类。
 
-**下一步：先编写导入流程的 state.py 和 main_graph.py，两份一起提交用户审核，通过后再开发节点。** 每次只完成一个节点及其必要工具适配，验证后交用户审核，通过后才能继续下一个。检索流程开始时同样先交 state.py/main_graph.py。代码需有必要注释；单节点自测放在本节点的 `if __name__ == "__main__":` 中，完整流程测试在该流程完成后放入 test/。详细规则见交接文档第 8 节。直接修改工作区源文件，不初始化 Git 或创建分支。
+**当前停在导入流程 state.py 和 main_graph.py 两份一起待用户审核的阶段，明确通过后才能开发节点。** 每次只完成一个节点及其必要工具适配，验证后交用户审核，通过后才能继续下一个。检索流程开始时同样先交 state.py/main_graph.py。代码需有必要注释；单节点自测放在本节点的 `if __name__ == "__main__":` 中，完整流程测试在该流程完成后放入 test/。详细规则见交接文档第 8 节。直接修改工作区源文件，不初始化 Git 或创建分支。
 
 ## 1. 总体架构与本期范围
 
@@ -286,7 +286,7 @@ flowchart TD
 | --- | --- | --- |
 | `entry` / `node_entry.py` | 校验文件类型、大小、上传参数与任务标识；将接口已创建的 `pending` 任务更新为 `running` | `task_id`、`document_id`、`upload_metadata` |
 | `save_file` / `node_save_file.py` | 上传原文件至 MinIO，记录文件名、对象键与文件指纹 | `source_file` |
-| `parse_file` / `node_parse_file.py` | 根据 MD、PDF、Word 选择解析器，必要时转换 Word 或对 PDF 执行 OCR；统一提取正文、标题、表格和来源位置 | `parsed_blocks`、`parse_warnings` |
+| `parse_file` / `node_parse_file.py` | 根据 MD、PDF、Word 选择解析器，必要时转换 Word 或对 PDF 执行 OCR；统一提取正文、标题、表格和来源位置 | `parsed_blocks`、`warnings` |
 | `extract_metadata` / `node_extract_metadata.py` | 合并上传信息和原文信息，识别内容类型、课程、项目、章节、题库等归属 | `document_metadata`、`typed_blocks`、`warnings` |
 | `build_records` / `node_build_records.py` | 根据内容类型调用对应构建器，校验必填项，生成完整记录与检索文本 | `records`、`chunks`、`rejected_records`、`counts` |
 | `embedding` / `node_embedding.py` | 批量生成稠密/稀疏向量，记录使用的模型标识；入库与查询使用相同模型和维度 | `embedded_records` |
@@ -304,7 +304,7 @@ flowchart TD
 
 一个文件可以混合多种内容类型，按内容块分类。对于无法可靠分离的题目或无法确认类型的内容，记录警告或拒绝原因，不强行猜测。
 
-### 3.3 `ImportState` 拟定字段
+### 3.3 `ImportState` 字段（骨架已编写，待审核）
 
 | 字段组 | 字段 |
 | --- | --- |
@@ -314,6 +314,10 @@ flowchart TD
 | 状态与输出 | `status`、`current_node`、`counts`、`warnings`、`rejected_records`、`error`、`result` |
 
 客户端、数据库连接和模型实例放在依赖容器或运行上下文中，不塞进图状态。大文件按批次处理，原始字节、全部文件内容和向量不长期重复存入任务文档。
+
+实现入口为 `create_initial_state(task_id=..., document_id=..., file_path=..., upload_metadata=...)`：每次创建独立容器并深拷贝上传元数据；初始为 pending、空 current_node、source_file/error 为 None，其余产物为空、计数为 0。轻量内容类型暂定义在 state.py，后续随节点迁入 common/schemas，保持单一定义。
+
+`build_import_graph(nodes, deps=..., bind_node=...)` 强制注入全部九个节点及统一执行绑定器；缺失/未知/不可调用节点明确报错。普通节点（含 finish）只用条件边，error 非 None 或状态 failed 时进入 handle_error，其余走正常后继；handle_error 直接 END。公共绑定器须负责 await、异常转 NodeError、阶段和日志，目前只有接口合同，尚无实现。骨架不包含默认节点或自动编译的全局图。
 
 ### 3.4 任务状态与入库可见性
 
@@ -518,3 +522,9 @@ LangGraph 的节点、共享状态和边的设计参照 [Graph API 官方文档]
 需要特别适配的旧代码包括：任务状态 processing/completed、仅内存任务追踪、SSE 的 ready/delta/final 事件名、按 session_id 隔离的队列、商品 item_names 历史字段、导入时尝试连接 MongoDB 的副作用，以及仅提供文档编码的 Embedding 工具。异步日志装饰器、历史顺序、失败被当成空结果等问题仍待改造；温度 0、模型来源和设备传参等配置调用问题已经修复并离线验证。逐文件证据、修改目标及验收要求见 [common与utils检查清单.md](common与utils检查清单.md)，业务仓储职责见交接文档第 7 节。
 
 2026-10-19 已统一 common/config 的 .env 加载、默认值、类型/布尔解析与延迟必填校验，新增 MongoDB 配置，修复温度 0、BGE_M3 和 Reranker 设备传参；占位说明见 `.env.example`。18 个配置/调用方离线测试及 common/utils/test 的 38 个 Python 文件语法检查通过，真实 `.env` 未修改。未新增业务节点、连接真实服务、创建集合或下载模型。WinError 10106 仍可在 asyncio 相关导入时重现，实际服务与模型集成尚未验证；common/utils 其余教育项目适配待办见检查清单第 6 节。
+
+2026-10-19 导入骨架交审：新增 `processor/import_processor/state.py`、`main_graph.py`；两个文件的 `__main__` 合同自检、原 18 个配置测试及全项目 46 个 Python 文件 AST 检查通过。锁文件/本地 LangGraph 均为 1.2.5，真实导入仍在 asyncio/_overlapped 处触发 WinError 10106，因此未验证实际 compile、依赖绑定执行或业务链。未新增节点、公共执行器或流程测试。当前待用户审核，未获明确通过前停止后续开发。
+
+2026-10-19 按用户反馈修订：main_graph.py 改为逐项 add_node、逐项添加条件边，去掉泛型/Protocol；测试入口使用真实 LangGraph 编译后调用 `get_graph().print_ascii()`，可直接看到包含错误分支的图。预览函数只在 __main__ 中定义，执行即抛 NotImplementedError；不调用 invoke/ainvoke，不代表业务已实现。state.py 本轮未改动。
+
+运行：`.venv/Scripts/python.exe -X utf8 -m processor.import_processor.main_graph`。本次定位 WinError 10106 为当前工具进程缺少 SystemRoot；仅在验证命令中设置 `$env:SystemRoot = 'C:\Windows'` 后，真实导入、编译、依赖绑定和全部 18 条边的结构断言及 ASCII 画图通过，未修改系统环境设置。两份自检、18 项配置测试和 46 文件 AST 复核通过。公共执行器、业务节点与真实服务仍未实现/验证，本轮交审后停止。
