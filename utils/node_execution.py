@@ -15,6 +15,9 @@ from utils.task_utils import ImportTaskStore, track_node_progress
 class ImportDependencies:
     tasks: ImportTaskStore
     max_file_bytes: int = 100 * 1024 * 1024  # Service 可覆盖的运行策略。
+    # 存储由调用方注入；entry 不需要，save_file 使用前检查，不自行兜底创建。
+    minio_client: Any | None = None
+    minio_bucket_name: str | None = None
 
     def __post_init__(self):
         if (isinstance(self.max_file_bytes, bool) or not isinstance(self.max_file_bytes, int)

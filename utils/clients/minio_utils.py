@@ -10,7 +10,7 @@ from common.logging.logger import logger            # 项目统一日志工具
 # 全局MinIO客户端实例（单例模式，避免重复创建连接，提升性能）
 _minio_client = None
 
-# 登录 准备(创建桶和设置权限) 并且返回一个minio的引用可以使用他 上传和删除文件
+# 使用现有配置创建客户端，不执行桶管理。
 def _create_minio_client():
     minio_config.validate()
     client = Minio(
@@ -43,9 +43,9 @@ def _create_minio_bucket(client:Minio):
         logger.info(f"{minio_config.bucket_name}已经存在,无需再次创建!")
 
 def get_minio_client():
+    """校验配置并创建、缓存客户端；不检查/创建桶，也不修改访问策略。"""
     global _minio_client
     if not _minio_client:
         client = _create_minio_client()
-        _create_minio_bucket(client)
         _minio_client = client
     return _minio_client
