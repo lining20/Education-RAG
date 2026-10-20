@@ -10,7 +10,7 @@ class MineruConfig:
     base_url: str | None = None
     api_key: str | None = field(default=None, repr=False)
     request_timeout: float = 30.0  # 秒；供后续 PDF 适配器使用
-    poll_interval: float = 2.0
+    poll_interval: float = 5.0
     max_poll_attempts: int = 60
 
     @classmethod
@@ -19,7 +19,7 @@ class MineruConfig:
             base_url=env_text("MINERU_BASE_URL", env=env),
             api_key=env_text("MINERU_API_TOKEN", env=env),
             request_timeout=env_float("MINERU_REQUEST_TIMEOUT", 30.0, positive=True, env=env),
-            poll_interval=env_float("MINERU_POLL_INTERVAL", 2.0, positive=True, env=env),
+            poll_interval=env_float("MINERU_POLL_INTERVAL", 5.0, positive=True, env=env),
             max_poll_attempts=env_int("MINERU_MAX_POLL_ATTEMPTS", 60, env=env),
         )
 

@@ -1,46 +1,44 @@
-"""
-工具模块，负责提供 rate limit 相关的辅助能力。
-"""
-import time
+"""参考项目的滑动窗口限流；窗口有额度立即放行，满额才异步等待。"""
+import asyncio
 from collections import deque
-from typing import Deque
-from common.logging.logger import logger  # 复用项目全局logger
+from time import monotonic
 
-_GLOBAL_REQUEST_TIMES: Deque[float] = deque()
-
-# 滑动窗口限速器 核心: 窗口时间内,超出了数量,等待(sleep)
-def apply_api_rate_limit(
-        max_requests: int = 3000,
-        window_seconds: int = 60
-) -> None:
-    """
-    通用滑动窗口API速率限制器（抽离为公共工具）
-    核心逻辑：维护请求时间戳双端队列，窗口内请求数超上限则自动等待，防止触发第三方API限流
-    :param max_requests: 速率限制窗口内的最大允许请求次数
-    :param window_seconds: 速率限制滑动窗口时长，默认60秒（1分钟）
-    :return: None，超出限制时会阻塞等待
-    """
-    current_time = time.time()
+from common.logging.logger import logger
+from utils.import_cancellation import check_import_cancelled
 
 
-    # 1. 清理滑动窗口外的过期请求时间戳，保证队列仅存窗口内的请求
-    # todo 本次进来,先清空超过了时间窗口的记录!
-    while _GLOBAL_REQUEST_TIMES and current_time - _GLOBAL_REQUEST_TIMES[0] >= window_seconds:
-        _GLOBAL_REQUEST_TIMES.popleft()
+class ApiRateLimiter:
+    """同一服务的所有文档共享实例；只对请求发起限速，不等待响应串行完成。"""
+    def __init__(self, max_requests: int = 3000, window_seconds: float = 60):
+        if max_requests <= 0 or window_seconds <= 0:
+            raise ValueError("请求次数和限流窗口必须大于 0")
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._times = deque()
+        self._lock = asyncio.Lock()
 
-    # todo _GLOBAL_REQUEST_TIMES 本次节点同一个窗口的记录
-    # 2. 窗口内请求数达上限，计算并阻塞等待剩余时间
-    if len(_GLOBAL_REQUEST_TIMES) >= max_requests:
-        # 计算需要等待的时长（窗口总时长 - 最早请求已存在的时长）
-        # todo 同一个时间窗口,超出了最大的访问限制! sleep
-        sleep_duration = window_seconds - (current_time - _GLOBAL_REQUEST_TIMES[0])
-        if sleep_duration > 0:
-            logger.debug(f"触发API速率限制，窗口{window_seconds}秒内最多{max_requests}次，需等待：{sleep_duration:.2f} 秒")
-            time.sleep(sleep_duration)
-            # 等待后更新当前时间，重新清理过期请求（避免等待期间有请求过期）
-            current_time = time.time()
-            while _GLOBAL_REQUEST_TIMES and current_time - _GLOBAL_REQUEST_TIMES[0] >= window_seconds:
-                _GLOBAL_REQUEST_TIMES.popleft()
-    # 3. 记录当前请求时间戳，加入滑动窗口队列
-    _GLOBAL_REQUEST_TIMES.append(current_time)
-    logger.debug(f"API请求时间戳已记录，当前{window_seconds}秒窗口内请求数：{len(_GLOBAL_REQUEST_TIMES)}")
+    async def acquire(self, *, stop_event=None):
+        logged = False
+        while True:
+            check_import_cancelled(stop_event)
+            async with self._lock:
+                now = monotonic()
+                while self._times and now - self._times[0] >= self.window_seconds:
+                    self._times.popleft()
+                delay = 0
+                if len(self._times) >= self.max_requests:
+                    delay = self._times[0] + self.window_seconds - now
+                if delay <= 0:
+                    self._times.append(now)
+                    logger.debug("API请求时间戳已记录，当前{}秒窗口内请求数：{}", self.window_seconds, len(self._times))
+                    return
+            if not logged:
+                logger.debug("模型请求限流：{}秒内最多{}次，等待约{:.2f}秒", self.window_seconds, self.max_requests, delay)
+                logged = True
+            # 等待不持锁，每 0.1 秒检查关闭信号，Ctrl+C 不必等完整限流窗口。
+            await asyncio.sleep(min(delay, 0.1))
+
+
+async def apply_api_rate_limit(limiter: ApiRateLimiter, *, stop_event=None) -> None:
+    """在实际模型请求前显式调用；Service 注入全局共享的配额实例。"""
+    await limiter.acquire(stop_event=stop_event)

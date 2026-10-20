@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from common.config._env import Env, env_float, env_text, require, validate_url
+from common.config._env import Env, env_bool, env_float, env_int, env_text, require, validate_url
 
 
 @dataclass(frozen=True)
@@ -12,6 +12,9 @@ class LLMConfig:
     vl_model: str | None = None
     llm_model: str = "qwen3-32b"
     llm_temperature: float = 0.1
+    vl_max_requests: int = 3000
+    vl_rate_window_seconds: float = 60
+    image_understanding_enabled: bool = False
 
     @classmethod
     def from_env(cls, env: Env | None = None):
@@ -21,6 +24,9 @@ class LLMConfig:
             vl_model=env_text("VL_MODEL", env=env),
             llm_model=env_text("LLM_DEFAULT_MODEL", "qwen3-32b", env=env),
             llm_temperature=env_float("LLM_DEFAULT_TEMPERATURE", 0.1, minimum=0, maximum=2, env=env),
+            vl_max_requests=env_int("VL_MAX_REQUESTS", 3000, env=env),
+            vl_rate_window_seconds=env_float("VL_RATE_WINDOW_SECONDS", 60, positive=True, env=env),
+            image_understanding_enabled=env_bool("IMAGE_UNDERSTANDING_ENABLED", False, env=env),
         )
 
     def validate(self):

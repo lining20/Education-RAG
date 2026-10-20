@@ -12,7 +12,6 @@ class MinIOConfig:
     access_key: str | None = field(default=None, repr=False)
     secret_key: str | None = field(default=None, repr=False)
     bucket_name: str | None = None
-    minio_img_dir: str = "images"
     minio_secure: bool = False
 
     @classmethod
@@ -22,7 +21,6 @@ class MinIOConfig:
             access_key=env_text("MINIO_ACCESS_KEY", env=env),
             secret_key=env_text("MINIO_SECRET_KEY", env=env),
             bucket_name=env_text("MINIO_BUCKET_NAME", env=env),
-            minio_img_dir=env_text("MINIO_IMG_DIR", "images", env=env),
             minio_secure=env_bool("MINIO_SECURE", False, env=env),
         )
 

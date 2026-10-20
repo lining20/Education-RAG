@@ -1,4 +1,4 @@
-"""MongoDB 仅保存按 session_id 关联的会话历史；导入任务和知识内容不入 MongoDB。"""
+"""MongoDB 保存按 session_id 关联的聊天历史及独立上传账号/登录会话；不保存导入任务和知识内容。"""
 from dataclasses import dataclass, field
 from common.config._env import ConfigError, Env, env_int, env_text, require, validate_url
 

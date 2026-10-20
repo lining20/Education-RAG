@@ -108,8 +108,9 @@ class ImportTaskStore:
         self._validate_node(previous_node)
         with self._lock:
             task = self._get_task(task_id, document_id)
-            if (task["status"] != "running" or task["current_node"] != previous_node
-                    or task["node_progress"].get(previous_node, {}).get("status") != "completed"):
+            previous_status = task["node_progress"].get(previous_node, {}).get("status")
+            allowed = previous_status == "completed" or (node == "handle_error" and previous_status == "failed")
+            if (task["status"] != "running" or task["current_node"] != previous_node or not allowed):
                 raise OperationError("TASK_STATE_CONFLICT", "前序阶段尚未完成或已被其他调用推进")
             now = _now_ms()
             task.update(current_node=node, updated_at=now)
@@ -151,7 +152,8 @@ class ImportTaskStore:
             phase = task["node_progress"].get(task["current_node"], {}).get("status")
             if (task["status"] != "running" or
                     (status == "succeeded" and (task["current_node"] != "finish" or phase != "completed")) or
-                    (status == "failed" and phase != "failed")):
+                    (status == "failed" and phase != "failed" and not
+                     (task["current_node"] == "handle_error" and phase == "completed"))):
                 raise OperationError("TASK_STATE_CONFLICT", "当前执行没有结束此任务的条件")
             task.update(status=status, result=deepcopy(result), finished_at=_now_ms())
 
@@ -167,6 +169,19 @@ class ImportTaskStore:
                 result[key] = [name for name, progress in task["node_progress"].items() if progress["status"] == status]
             return result
 
+    def abort_task(self, task_id: str, document_id: str, error: dict) -> None:
+        """仅供服务执行器兜底；保留真实节点失败，避免异常退出后永久运行。"""
+        with self._lock:
+            task = self._get_task(task_id, document_id)
+            if task["status"] in {"succeeded", "failed"}:
+                return
+            now = _now_ms()
+            for progress in task["node_progress"].values():
+                if progress["status"] == "running":
+                    progress.update(status="failed", error=deepcopy(error), finished_at=now)
+            task.update(status="failed", finished_at=now,
+                        result={"status": "failed", "error": deepcopy(error)})
+
     def clear(self, task_id: str) -> None:
         """由 Service 在保留期结束后释放终态任务，避免进程内无限积累。"""
         with self._lock:
@@ -174,14 +189,6 @@ class ImportTaskStore:
             if task["status"] not in {"succeeded", "failed"}:
                 raise OperationError("TASK_STATE_CONFLICT", "不能清除尚未结束的任务")
             del self._tasks[task_id]
-
-
-_task_store = ImportTaskStore()
-
-
-def get_task_store() -> ImportTaskStore:
-    """单进程内复用；启动多个 worker 会各有一份内存任务表，本期不支持。"""
-    return _task_store
 
 
 async def add_running_task(state: dict, node: str, *, tasks: ImportTaskStore) -> float:
@@ -201,15 +208,3 @@ async def add_done_task(state: dict, node: str, *, tasks: ImportTaskStore,
     """全部业务步骤成功后调用：移出运行列表，加入已完成列表。"""
     await tasks.complete_node(state["task_id"], state["document_id"], node,
                               round((perf_counter() - started_at) * 1000, 3), counts)
-
-
-def get_running_task_list(task_id: str) -> list[str]:
-    return get_task_store().get(task_id)["running_nodes"]
-
-
-def get_done_task_list(task_id: str) -> list[str]:
-    return get_task_store().get(task_id)["completed_nodes"]
-
-
-def get_task_status(task_id: str) -> str:
-    return get_task_store().get(task_id)["status"]

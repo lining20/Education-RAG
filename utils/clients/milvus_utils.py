@@ -1,5 +1,3 @@
-import json
-
 from pymilvus import MilvusClient, AnnSearchRequest, RRFRanker, WeightedRanker
 
 from common.config.milvus_config import milvus_config
@@ -29,88 +27,29 @@ def get_milvus_client():
         return None
 
 
-def _normalize_chunk_ids(ids):
+def escape_milvus_string(value: str) -> str:
     """
-    校验三个教育集合共用的 VARCHAR 主键，并去重。
-    :param ids: 待转换的chunk_id列表
-    :return: 元组(ok_ids, bad_ids)，不将旧版整数主键转换后混用
+    Milvus过滤表达式专用字符串安全转义函数
+    核心作用：
+        避免因原始字符串含特殊字符，导致Milvus解析filter_expr时报错，保证CRUD操作正常执行
+    转义规则：
+        1. 反斜杠（\）→ 双反斜杠（\\）：Milvus表达式转义规则
+        2. 双引号（"）→ 转义双引号（\"）：避免截断字符串表达式
+        3. 换行/回车/制表符 → 空格：防止表达式换行导致解析失败
+    参数：
+        value: 需要转义的原始字符串（如商品名称、文件标题）
+    返回：
+        str: 转义后的安全字符串，可直接用于Milvus的filter_expr
     """
-    ok, bad = [], []
-    for x in (ids or []):
-        if not isinstance(x, str) or not x.strip():
-            bad.append(x)
-        elif x not in ok:
-            ok.append(x)
-    return ok, bad
-
-
-def fetch_chunks_by_chunk_ids(
-        client,
-        collection_name: str,
-        chunk_ids,
-        *,
-        output_fields=None,
-        batch_size: int = 100,
-):
-    """
-    通过chunk_id主键批量查询Milvus中的切片数据
-    用于补全「仅拥有chunk_id无文本内容」场景的切片信息
-    优先使用get方法（主键直查，性能最优），失败则回退query过滤查询
-    :param client: MilvusClient实例
-    :param collection_name: 集合名称
-    :param chunk_ids: 待查询的chunk_id列表
-    :param output_fields: 需要返回的字段列表，默认返回切片、完整内容及清单字段
-    :param batch_size: 分批查询大小，避免单次查询数据量过大，默认100
-    :return: List[dict]，Milvus实体字典列表，查询失败返回空列表
-    """
-    # 前置校验：客户端/集合名无效直接返回空
-    if client is None:
-        return []
-    if not collection_name:
-        return []
-    # 默认返回字段：核心切片标识与内容字段
-    if output_fields is None:
-        output_fields = [
-            "chunk_id", "record_id", "task_id", "content",
-            "source_file_name", "source_object_key", "source_locator",
-            "record_payload", "payload_object_key", "import_manifest_key",
-        ]
-
-    # 三个集合均使用应用生成的字符串 UUID 主键。
-    ok_ids, bad_ids = _normalize_chunk_ids(chunk_ids)
-    if bad_ids:
-        # 记录无效ID，跳过查询
-        logger.warning(f"存在非法的字符串chunk_id，将跳过查询：{bad_ids}")
-
-    # 无有效ID直接返回空
-    if not ok_ids:
-        return []
-
-    results = []
-    # 分批查询：按batch_size切分有效ID，循环查询
-    for i in range(0, len(ok_ids), batch_size):
-        batch = ok_ids[i: i + batch_size]
-
-        # 方式1：优先使用主键get方法查询（性能最优）
-        if hasattr(client, "get"):
-            try:
-                got = client.get(collection_name=collection_name, ids=batch, output_fields=output_fields)
-                if got:
-                    results.extend(got)
-                continue
-            except Exception as e:
-                logger.warning(f"Milvus get方法查询失败，将回退至query方法：{str(e)}")
-
-        # 方式2：get方法失败，回退使用filter过滤查询
-        try:
-            expr = "chunk_id in " + json.dumps(batch, ensure_ascii=False)
-            q = client.query(collection_name=collection_name, filter=expr, output_fields=output_fields)
-            if q:
-                results.extend(q)
-        except Exception as e:
-            logger.error(f"Milvus query方法批量查询chunk_id失败：{str(e)}", exc_info=True)
-
-    return results
+    if value is None:
+        return ""
+    # 确保输入为字符串类型，避免非字符串值报错
+    s = str(value)
+    # 按Milvus规则转义特殊字符
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    # 替换换行/回车/制表符为空格，保证表达式单行有效
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return s
 
 
 def create_hybrid_search_requests(dense_vector, sparse_vector, dense_params=None, sparse_params=None, expr=None,
@@ -192,6 +131,8 @@ def hybrid_search(client, collection_name, reqs, ranker_weights=None, norm_score
             ranker=rerank,
             limit=limit,
             output_fields=output_fields,
+            timeout=milvus_config.timeout,
+            consistency_level="Strong",
             search_params=search_params
         )
 

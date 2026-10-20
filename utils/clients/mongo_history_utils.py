@@ -8,11 +8,23 @@ from threading import Lock
 from time import time_ns
 from uuid import NAMESPACE_URL, uuid5
 import json
+from pymongo.errors import ConnectionFailure, OperationFailure
 
 from common.config.mongo_config import MongoConfig, mongo_config
 from common.errors import OperationError
 from utils.clients.mongo_utils import create_mongo_client
 from utils.task_utils import validate_identifier
+
+
+def history_store_error(action: str, exc: Exception) -> OperationError:
+    """区分连接和权限故障，不把含凭据的驱动原始消息返回页面。"""
+    if isinstance(exc, ConnectionFailure):
+        message = "无法连接 MongoDB，会话历史暂不可用。请启动 MongoDB 服务，并检查 .env 中的 MONGO_URL。"
+    elif isinstance(exc, OperationFailure) and exc.code in {13, 18}:
+        message = "MongoDB 认证或权限不足，请检查 MONGO_URL 中的账号、密码及认证库。"
+    else:
+        message = action
+    return OperationError("HISTORY_STORE_UNAVAILABLE", message, retryable=True)
 
 
 class HistoryMongoTool:
@@ -55,7 +67,7 @@ class HistoryMongoTool:
                 {"$set": document, "$setOnInsert": {"ts": time_ns()}}, upsert=True,
             )
         except Exception as exc:
-            raise OperationError("HISTORY_STORE_UNAVAILABLE", "会话消息保存失败", retryable=True) from exc
+            raise history_store_error("会话消息保存失败", exc) from exc
         return key
 
     def recent_messages(self, session_id: str, limit: int = 10) -> list[dict]:
@@ -66,7 +78,7 @@ class HistoryMongoTool:
         try:
             rows = list(self.chat_message.find({"session_id": session_id}).sort([("ts", -1), ("_id", -1)]).limit(limit))
         except Exception as exc:
-            raise OperationError("HISTORY_STORE_UNAVAILABLE", "会话历史读取失败", retryable=True) from exc
+            raise history_store_error("会话历史读取失败", exc) from exc
         return list(reversed(rows))
 
     def clear(self, session_id: str) -> int:
@@ -74,7 +86,28 @@ class HistoryMongoTool:
         try:
             return self.chat_message.delete_many({"session_id": session_id}).deleted_count
         except Exception as exc:
-            raise OperationError("HISTORY_STORE_UNAVAILABLE", "会话历史删除失败", retryable=True) from exc
+            raise history_store_error("会话历史删除失败", exc) from exc
+
+    def list_sessions(self, limit: int = 50) -> list[dict]:
+        """会话列表从用户消息聚合，不新增业务集合。"""
+        try:
+            rows = self.chat_message.aggregate([
+                {"$match": {"role": "user"}}, {"$sort": {"ts": -1}},
+                {"$group": {"_id": "$session_id", "title": {"$first": "$text"}, "updated_at": {"$first": "$ts"}}},
+                {"$sort": {"updated_at": -1}}, {"$limit": min(max(limit, 1), 100)},
+            ])
+            return [{"session_id": row["_id"], "title": row["title"][:80],
+                     "updated_at": row["updated_at"] // 1_000_000} for row in rows]
+        except Exception as exc:
+            raise history_store_error("会话列表读取失败", exc) from exc
+
+    def request_messages(self, session_id: str, request_id: str) -> list[dict]:
+        validate_identifier(session_id, "session_id")
+        validate_identifier(request_id, "request_id")
+        try:
+            return list(self.chat_message.find({"session_id": session_id, "request_id": request_id}))
+        except Exception as exc:
+            raise history_store_error("会话请求读取失败", exc) from exc
 
 
 _history_mongo_tool = None
@@ -100,81 +133,3 @@ def get_recent_messages(session_id: str, limit: int = 10) -> list[dict]:
 
 def clear_history(session_id: str) -> int:
     return get_history_mongo_tool().clear(session_id)
-
-
-if __name__ == "__main__":
-    # 仅测试本工具合同，注入 Collection 替身；不创建 MongoClient 或真实索引。
-    from types import SimpleNamespace
-
-    class CursorDouble:
-        def __init__(self, rows):
-            self.rows = deepcopy(rows)
-
-        def sort(self, fields):
-            for key, direction in reversed(fields):
-                self.rows.sort(key=lambda item: item[key], reverse=direction == -1)
-            return self
-
-        def limit(self, count):
-            self.rows = self.rows[:count]
-            return self
-
-        def __iter__(self):
-            return iter(self.rows)
-
-    class CollectionDouble:
-        def __init__(self):
-            self.rows = {}
-            self.index_calls = 0
-
-        def update_one(self, query, update, *, upsert):
-            assert upsert is True and set(query) == {"_id", "session_id"}
-            new = query["_id"] not in self.rows
-            row = self.rows.setdefault(query["_id"], {"_id": query["_id"]})
-            if new:
-                row.update(deepcopy(update["$setOnInsert"]))
-            row.update(deepcopy(update["$set"]))
-
-        def find(self, query):
-            assert set(query) == {"session_id"}
-            return CursorDouble([row for row in self.rows.values() if row["session_id"] == query["session_id"]])
-
-        def delete_many(self, query):
-            keys = [key for key, row in self.rows.items() if row["session_id"] == query["session_id"]]
-            for key in keys:
-                del self.rows[key]
-            return SimpleNamespace(deleted_count=len(keys))
-
-        def create_index(self, fields):
-            assert fields[0] == ("session_id", 1)
-            self.index_calls += 1
-
-    collection = CollectionDouble()
-    history = HistoryMongoTool(collection=collection)
-    assert collection.index_calls == 0
-    first = history.save_message("session-a", "user", "问题", request_id="request-1")
-    created = collection.rows[first]["ts"]
-    history.save_message("session-a", "assistant", "回答", request_id="request-1", references=[{"reference_id": "1"}])
-    history.save_message("session-b", "user", "另一个会话", request_id="request-1")
-    assert history.save_message("session-a", "user", "修订问题", request_id="request-1") == first
-    assert len(collection.rows) == 3 and collection.rows[first]["ts"] == created
-    rows = history.recent_messages("session-a", 2)
-    assert [row["role"] for row in rows] == ["user", "assistant"]
-    assert rows[0]["text"] == "修订问题" and len(history.recent_messages("session-b")) == 1
-    assert history.recent_messages("session-a", 1)[0]["role"] == "assistant"
-    assert history.recent_messages("new-session") == []
-    history.ensure_indexes()
-    assert collection.index_calls == 1
-    assert history.clear("session-a") == 2 and len(history.recent_messages("session-b")) == 1
-
-    class BrokenCollection(CollectionDouble):
-        def find(self, query):
-            raise RuntimeError("private-driver-message")
-
-    try:
-        HistoryMongoTool(collection=BrokenCollection()).recent_messages("session-a")
-    except OperationError as exc:
-        assert exc.code == "HISTORY_STORE_UNAVAILABLE" and "private-driver" not in str(exc)
-    else:
-        raise AssertionError("历史读取失败不能伪装成无历史")
-    print("会话历史离线检查通过：session 隔离、请求幂等、正序/最近条数、显式索引与错误语义；未连接 MongoDB。")

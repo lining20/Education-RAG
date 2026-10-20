@@ -14,4 +14,8 @@ class OperationError(Exception):
 def error_summary(exc: Exception) -> tuple[str, str, bool]:
     if isinstance(exc, OperationError):
         return exc.code, exc.message, exc.retryable
+    # 配置错误仅含变量名与约束，可向上传者展示；不回显 SDK 原始消息。
+    from common.config._env import ConfigError
+    if isinstance(exc, ConfigError):
+        return "CONFIGURATION_ERROR", str(exc), False
     return "NODE_EXECUTION_FAILED", "节点执行失败，请通过任务标识核对日志", False

@@ -7,12 +7,12 @@ from typing import Optional
 from common.config.lm_config import lm_config
 from common.logging.logger import logger
 
-# 全局缓存：键为(模型名, JSON输出模式)元组，值为ChatOpenAI实例
+# 全局缓存：键为(模型名, JSON输出模式, SDK重试次数)，值为ChatOpenAI实例
 # 作用：避免重复初始化客户端，提升性能，统一实例管理
 _llm_client_cache = {}
 
 
-def get_llm_client(model: Optional[str] = None, json_mode: bool = False) -> ChatOpenAI:
+def get_llm_client(model: Optional[str] = None, json_mode: bool = False, *, max_retries: int = 2) -> ChatOpenAI:
     """
     获取带全局缓存的LangChain ChatOpenAI客户端实例
     适配OpenAI/千问/即梦AI等**OpenAI兼容API**，支持自定义模型和JSON标准化输出
@@ -20,6 +20,7 @@ def get_llm_client(model: Optional[str] = None, json_mode: bool = False) -> Chat
 
     :param model: 模型名称，优先级：传入参数 > 配置文件lm_config.llm_model > 内置默认qwen3-32b
     :param json_mode: 是否开启JSON输出模式，开启后返回标准json_object格式（适配结构化数据解析）
+    :param max_retries: SDK重试次数；视觉限流请求设为0，避免自动重试绕过请求配额。
     :return: 初始化完成的ChatOpenAI实例（优先从全局缓存获取，未命中则新建并缓存）
     :raise ValueError: 缺失API密钥/基础地址等核心配置
     :raise Exception: 模型初始化失败（LangChain封装层异常）
@@ -27,7 +28,7 @@ def get_llm_client(model: Optional[str] = None, json_mode: bool = False) -> Chat
     # 1. 确定目标模型（优先级递减，保证模型名非空）
     target_model = model or lm_config.llm_model or "qwen3-32b"
     # 缓存键：模型名+JSON模式，唯一标识不同配置的客户端
-    cache_key = (target_model, json_mode)
+    cache_key = (target_model, json_mode, max_retries)
 
     # 2. 缓存命中：直接返回已初始化的实例，避免重复创建
     if cache_key in _llm_client_cache:
@@ -38,9 +39,16 @@ def get_llm_client(model: Optional[str] = None, json_mode: bool = False) -> Chat
     lm_config.validate()
     logger.info(f"[LLM客户端] 开始初始化新实例：模型={target_model}，JSON模式={json_mode}")
 
-    # 4. 配置参数组装：区分「国产模型私有参数」和「OpenAI通用参数」
-    # extra_body：千问/即梦等国产模型专属私有参数（LangChain透传至API）
-    extra_body = {"enable_thinking": False}  # 千问专属：关闭思考链输出，减少冗余内容
+    # 4. 私有参数按模型选择，不能把千问参数发给 Kimi 等其他模型。
+    model_name = target_model.rsplit("/", 1)[-1].lower()
+    extra_body = {"enable_thinking": False} if model_name.startswith(("qwen", "qwq")) else None
+    temperature = lm_config.llm_temperature
+    client_options = {}
+    if model_name.startswith("kimi-k3"):
+        # K3 固定采样参数且始终思考；省略 temperature，低思考强度适合检索链。
+        temperature = None
+        client_options["reasoning_effort"] = "low"
+        logger.debug("[LLM客户端] Kimi K3 使用默认采样参数，reasoning_effort=low")
     # model_kwargs：OpenAI通用参数，所有兼容API均支持
     model_kwargs = {}
     if json_mode:
@@ -52,11 +60,13 @@ def get_llm_client(model: Optional[str] = None, json_mode: bool = False) -> Chat
     try:
         llm_client = ChatOpenAI(
             model=target_model,  # 目标模型名
-            temperature=lm_config.llm_temperature,  # 配置层处理缺省，保留合法的 0
+            temperature=temperature,
             api_key=lm_config.api_key,  # API密钥
             base_url=lm_config.base_url,  # API基础地址（适配国产模型代理地址）
             extra_body=extra_body,  # 国产模型私有参数透传
             model_kwargs=model_kwargs,  # OpenAI通用参数
+            max_retries=max_retries,
+            **client_options,
         )
     except LangChainException as e:
         raise Exception(f"[LLM客户端] 模型【{target_model}】初始化失败（LangChain层）：{str(e)}") from e
@@ -69,26 +79,3 @@ def get_llm_client(model: Optional[str] = None, json_mode: bool = False) -> Chat
 
 
 # 测试示例：验证客户端创建、缓存机制及日志输出
-if __name__ == "__main__":
-    logger.info("===== 开始执行LLM客户端工具测试 =====")
-    try:
-        # 测试1：默认配置（默认模型+普通模式）
-        client1 = get_llm_client()
-        logger.info("✅ 测试1通过：默认配置客户端创建成功")
-
-        # 测试2：指定多模态模型（qwen-vl-plus）+ 普通模式
-        client2 = get_llm_client(model="qwen-vl-plus")
-        logger.info("✅ 测试2通过：指定多模态模型客户端创建成功")
-
-        # 测试3：同一模型+模式，验证缓存命中
-        client3 = get_llm_client(model="qwen-vl-plus")
-        logger.info(f"✅ 测试3通过：缓存机制验证成功，client2与client3为同一实例：{client2 is client3}")
-
-        # 测试4：开启JSON输出模式
-        client4 = get_llm_client(model="qwen3-32b", json_mode=True)
-        logger.info("✅ 测试4通过：JSON输出模式客户端创建成功")
-
-    except Exception as e:
-        logger.error(f"❌ LLM客户端工具测试失败：{str(e)}", exc_info=True)
-    finally:
-        logger.info("===== LLM客户端工具测试结束 =====")

@@ -31,7 +31,14 @@ dependencies = [
     "transformers>=4.57.6",
     "datasets>=4.8.4",
     "openai-agents>=0.4.2",
-    "requests>=2.32.5"
+    "requests>=2.32.5",
+    "markdown-it-py>=4,<5",
+    "python-docx>=1.2,<2",
+    "pymupdf>=1.24.9,<1.25",
+    "langchain-text-splitters>=1.1.2,<2",
+    "pillow>=12.2,<13",
+    "urllib3>=2,<3",
+    "httpx>=0.28,<1",
 ]
 # 全局镜像源配置
 [[tool.uv.index]]

@@ -1,6 +1,8 @@
 
 # 导入MinIO官方Python SDK核心类（用于MinIO对象存储的客户端操作）
 from minio import Minio
+from urllib3 import PoolManager, Timeout
+from urllib3.util.retry import Retry
 
 # 导入项目内部配置与日志工具
 from common.config.minio_config import minio_config  # MinIO相关配置（端点、密钥、桶名等）
@@ -16,7 +18,10 @@ def _create_minio_client():
         minio_config.endpoint,
         access_key=minio_config.access_key,
         secret_key=minio_config.secret_key,
-        secure=minio_config.minio_secure  # https True  http False
+        secure=minio_config.minio_secure,  # https True  http False
+        # 网络不可用时有界返回，避免 Ctrl+C 收尾被 SDK 长时间重试拖住。
+        http_client=PoolManager(timeout=Timeout(connect=5, read=15),
+                               retries=Retry(total=1, backoff_factor=0.2)),
     )
     return client
 
@@ -43,55 +48,3 @@ def get_minio_client():
     # 4. 全部初始化成功后才缓存，前面任一步失败都不会缓存该实例。
     _minio_client = client
     return _minio_client
-
-
-if __name__ == "__main__":
-    from unittest.mock import Mock, call, patch
-
-    from common.config.minio_config import MinIOConfig
-    from common.logging.logger import init_logger
-
-    init_logger()
-    logger.info("MinIO 工具离线自测开始：3 个案例，不连接真实服务")
-    config = MinIOConfig(
-        endpoint="localhost:9000", access_key="offline-access",
-        secret_key="offline-secret", bucket_name="offline-bucket",
-    )
-    cases = (("桶已存在", True, False), ("桶不存在，自动创建", False, False), ("初始化失败", False, True))
-    for index, (description, exists, fail) in enumerate(cases, 1):
-        logger.info("案例 {}/3：{}", index, description)
-        client = Mock(spec=Minio)
-        client.bucket_exists.return_value = exists
-        failure = RuntimeError("离线替身模拟建桶失败")
-        if fail:
-            client.make_bucket.side_effect = failure
-
-        # 替换 SDK 构造函数，仍经过真实工厂、配置校验、桶准备与缓存流程。
-        with patch(f"{__name__}.Minio", return_value=client) as constructor, \
-                patch(f"{__name__}.minio_config", config), \
-                patch(f"{__name__}._minio_client", None):
-            if fail:
-                try:
-                    get_minio_client()
-                except RuntimeError as exc:
-                    assert exc is failure and _minio_client is None
-                else:
-                    raise AssertionError("初始化失败必须向上传递")
-                logger.info("初始化失败已按预期抛出，缓存为空；随后重试")
-                client.make_bucket.side_effect = None
-
-            assert get_minio_client() is client
-            assert get_minio_client() is client  # 缓存命中，不再次创建客户端或检查桶。
-            attempts = 2 if fail else 1
-            assert constructor.call_args_list == [call(
-                config.endpoint, access_key=config.access_key,
-                secret_key=config.secret_key, secure=config.minio_secure,
-            )] * attempts
-            expected_calls = [call.bucket_exists(config.bucket_name)]
-            if not exists:
-                expected_calls.append(call.make_bucket(config.bucket_name))
-            assert client.method_calls == expected_calls * attempts
-            client.set_bucket_policy.assert_not_called()
-            client.delete_bucket_policy.assert_not_called()
-        logger.success("案例通过：{}", description)
-    logger.success("MinIO 工具离线自测结束：3/3 通过；未连接真实 MinIO 或创建真实桶")

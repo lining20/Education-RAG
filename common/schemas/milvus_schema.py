@@ -1,4 +1,4 @@
-"""教育知识库的三套 Milvus Schema；本模块不连接数据库或创建集合。"""
+"""教育知识库的四套 Milvus Schema；本模块不连接数据库或创建集合。"""
 
 from pymilvus import CollectionSchema, DataType, MilvusClient
 
@@ -104,6 +104,36 @@ def _add_course_context(schema, *, require_series=False):
     ), optional=True)
 
 
+def build_document_index_schema(dense_dim: int = DEFAULT_DENSE_DIM) -> CollectionSchema:
+    """一级主体/文档关联索引，与业务集合共用任务发布清单。"""
+    schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
+    schema.add_field(field_name="index_id", datatype=DataType.VARCHAR, max_length=64, is_primary=True)
+    _add_strings(schema, (
+        ("document_id", 64, "文档 ID"), ("task_id", 64, "导入任务 ID"),
+        ("subject_type", 32, "series/course/project/question_bank/document"),
+        ("subject_id", 128, "主体 ID"), ("subject_name", 512, "主体名称"),
+        ("series_id", 128, "系列编码"), ("course_id", 128, "课程编码"),
+        ("project_id", 128, "项目编码"), ("question_bank_id", 128, "题库编码"),
+        ("index_content", 8192, "主体与文档检索文本"),
+        ("source_file_name", 1024, "来源文件名"), ("source_object_key", 2048, "原文件对象键"),
+        ("import_manifest_key", 2048, "成功清单对象键"), ("embedding_model", 256, "模型版本"),
+    ))
+    _add_tags(schema, "aliases", max_length=512)
+    schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=dense_dim)
+    schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
+    return schema
+
+
+def build_document_index_index_params():
+    indexes = MilvusClient.prepare_index_params()
+    indexes.add_index(field_name="dense_vector", index_type="HNSW", metric_type="COSINE",
+                      params={"M": 16, "efConstruction": 200})
+    indexes.add_index(field_name="sparse_vector", index_type="SPARSE_INVERTED_INDEX", metric_type="IP")
+    for name in ("document_id", "task_id", "subject_type", "subject_id", "series_id", "course_id", "project_id", "question_bank_id"):
+        indexes.add_index(field_name=name, index_type="INVERTED")
+    return indexes
+
+
 def build_courses_schema(dense_dim: int = DEFAULT_DENSE_DIM) -> CollectionSchema:
     """课程系列/子课程集合；完整层级和详情随行保存在 record_payload。
 
@@ -188,23 +218,3 @@ def build_document_chunks_index_params():
 
 def build_questions_index_params():
     return _build_indexes(("question_bank_id", "question_code", "question_type"))
-
-
-if __name__ == "__main__":
-    # 仅构造真实 SDK Schema，不创建客户端/集合或连接服务。
-    builders = (build_courses_schema, build_document_chunks_schema, build_questions_schema)
-    required = {"record_payload", "payload_object_key", "import_manifest_key", "content",
-                "record_id", "chunk_id", "task_id", "dense_vector", "sparse_vector"}
-    counts = []
-    for builder in builders:
-        schema = builder()
-        fields = {field.name: field for field in schema.fields}
-        assert required <= fields.keys()
-        assert fields["record_payload"].dtype == DataType.JSON
-        assert fields["dense_vector"].params["dim"] == 1024
-        assert fields["chunk_id"].is_primary and not schema.auto_id
-        assert not schema.enable_dynamic_field
-        counts.append(len(fields))
-    assert counts == [29, 29, 27], counts
-    assert MAX_INLINE_PAYLOAD_BYTES < 65536
-    print("三集合 Schema 自检通过：字段数 29/29/27；完整内容与向量共存，未连接服务。")

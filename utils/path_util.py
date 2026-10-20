@@ -7,10 +7,6 @@ import stat
 from common.errors import OperationError
 
 
-def get_path_dir(ps: int = 0) -> Path:
-    return Path(__file__).parents[ps]
-
-
 def get_project_root(identifier: str = ".env") -> Path:
     env_root = os.getenv("PROJECT_ROOT", "").strip()
     if env_root:

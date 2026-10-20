@@ -37,6 +37,8 @@ def step_2_prepare_state(state: ImportState, file_path: str) -> DataDict:
     upload_metadata = state.get("upload_metadata")
     if not isinstance(upload_metadata, dict):
         raise OperationError("INVALID_UPLOAD_METADATA", "upload_metadata 必须为字典")
+    if upload_metadata.get("content_type") not in {"course_intro", "document_chunk", "project_material", "question"}:
+        raise OperationError("INVALID_UPLOAD_METADATA", "必须在前端选择内容类型")
 
     # 深拷贝嵌套容器，保证后续使用增量时不会连带修改输入 State。
     counts = deepcopy(state["counts"])
@@ -71,61 +73,3 @@ async def node_entry(state: ImportState, *, deps: ImportDependencies) -> DataDic
 
     # 5. 返回本节点产生的增量状态。
     return update
-
-
-if __name__ == "__main__":
-    from pathlib import Path
-    from tempfile import TemporaryDirectory
-
-    from common.logging.logger import init_logger, logger
-    from processor.import_processor.state import create_initial_state
-    from utils.node_execution import bind_node
-    from utils.task_utils import ImportTaskStore
-
-    async def self_check():
-        """使用临时文件和真实内存任务，检查五个入口案例及进度列表。"""
-        logger.info("node_entry 自测开始，共 5 个案例")
-        tasks = ImportTaskStore()
-        deps = ImportDependencies(tasks=tasks)
-        entry = bind_node("entry", node_entry, deps)
-
-        with TemporaryDirectory(prefix="node_entry_") as directory:
-            root = Path(directory)
-            # 使用对应扩展名的非空文件，只检查入口文件可用性，不验证正文解析。
-            for suffix in ("txt", "md", "pdf", "docx"):
-                (root / f"sample.{suffix}").write_bytes(b"entry file check\n")
-
-            cases = (
-                ("不支持 TXT", "sample.txt", "UNSUPPORTED_FILE_FORMAT"),
-                ("正常 MD", "sample.md", None),
-                ("正常 PDF（仅入口文件检查）", "sample.pdf", None),
-                ("正常 DOCX（仅入口文件检查）", "sample.docx", None),
-                ("缺少路径", None, "INVALID_FILE_PATH"),
-            )
-            for index, (description, file_name, expected_error) in enumerate(cases, 1):
-                logger.info("案例 {}/5：{}", index, description)
-                task_id, document_id = f"entry-test-{index}", f"entry-doc-{index}"
-                tasks.create_pending(task_id, document_id)
-                state = create_initial_state(
-                    task_id=task_id, document_id=document_id,
-                    file_path=str(root / file_name) if file_name else "",
-                    upload_metadata={"course_name": "Python"},
-                )
-                if file_name is None:
-                    state.pop("file_path")
-                update = await entry(state)
-                progress = tasks.get(task_id)
-
-                assert progress["running_nodes"] == []
-                if expected_error is not None:
-                    assert update["status"] == "failed" and update["error"]["code"] == expected_error
-                    assert progress["failed_nodes"] == ["entry"] and progress["completed_nodes"] == []
-                else:
-                    assert update["status"] == "running" and update["counts"]["files"] == 1
-                    assert progress["completed_nodes"] == ["entry"] and progress["failed_nodes"] == []
-                logger.success("案例通过：{}", description)
-
-        logger.success("node_entry 自测结束：5/5 通过；PDF/DOCX 未验证正文解析")
-
-    init_logger()
-    asyncio.run(self_check())

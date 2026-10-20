@@ -1,0 +1,30 @@
+flowchart TD
+    start(["START"])
+    stop(["END"])
+    subject_confirm["主体确认、意图识别与改写<br/>node_subject_confirm<br/>读历史 → 一级索引定位主体 / 文档 → 确定检索范围"]
+    search_embedding["原问题混合检索<br/>node_search_embedding<br/>按业务意图选课程 / 文档 / 题目集合"]
+    search_hyde["HyDE 增强检索<br/>node_search_hyde<br/>假设答案只用于召回，不作为证据"]
+    web_search["网络检索<br/>node_web_search<br/>可选、默认关闭；外部来源单独标注"]
+    rrf["汇合与 RRF 融合<br/>node_rrf<br/>按各路排名融合；核验来源，保留真实证据"]
+    rerank["精确重排序<br/>node_rerank<br/>BGE-Reranker；去重与上下文预算"]
+    answer_output["组织结果 / 生成回答<br/>node_answer_output<br/>结构化查找直接返回；知识问答带引用、可流式"]
+    finish["保存会话与返回结果<br/>node_finish<br/>MongoDB 按 session_id 保存；请求按 request_id 隔离"]
+    handle_error["错误收尾<br/>node_handle_error<br/>失败 / 中断与无结果分开记录"]
+    start --> subject_confirm
+    answer_output -.->|"ok"| finish
+    answer_output -.->|"error"| handle_error
+    finish -.->|"ok"| stop
+    finish -.->|"error"| handle_error
+    rerank -.->|"ok"| answer_output
+    rerank -.->|"error"| handle_error
+    rrf -.->|"error"| handle_error
+    rrf -.->|"ok"| rerank
+    search_embedding --> rrf
+    search_hyde --> rrf
+    subject_confirm -.->|"direct"| answer_output
+    subject_confirm -.->|"error"| handle_error
+    subject_confirm -.->|"vector"| search_embedding
+    subject_confirm -.->|"hyde"| search_hyde
+    subject_confirm -.->|"web"| web_search
+    web_search --> rrf
+    handle_error --> stop

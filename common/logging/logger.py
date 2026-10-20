@@ -39,7 +39,12 @@ def fix_log_position(record: dict[str, Any]) -> None:
         while frame is not None:
             module = frame.f_globals.get("__name__", "")
             if module != __name__ and not module.startswith("loguru"):
-                record.update(name=module, function=frame.f_code.co_name, line=frame.f_lineno)
+                if module.startswith("asyncio") and record["extra"].get("log_source_module"):
+                    record.update(name=record["extra"]["log_source_module"],
+                                  function=record["extra"]["log_source_function"],
+                                  line=record["extra"]["log_source_line"])
+                else:
+                    record.update(name=module, function=frame.f_code.co_name, line=frame.f_lineno)
                 break
             frame = frame.f_back
     finally:
@@ -126,11 +131,13 @@ def _execution_log(kind: str, name: str) -> Callable:
     label = "节点" if kind == "node" else "步骤"
 
     def decorate(func: Callable) -> Callable:
+        source = {"log_source_module": func.__module__, "log_source_function": func.__name__,
+                  "log_source_line": func.__code__.co_firstlineno}
         if inspect.iscoroutinefunction(func):
             @wraps(func)
             async def async_wrapper(*args, **kwargs):
                 fields = trace_fields(args[0] if args else kwargs.get("state"))
-                with logger.contextualize(**fields, **{kind: name}):
+                with logger.contextualize(**fields, **{kind: name}, **source):
                     started = perf_counter()
                     trace_id = fields.get("task_id") or fields.get("request_id") or fields.get("session_id") or "-"
                     trace = f"，追踪ID={trace_id}" if kind == "node" else ""
@@ -150,7 +157,7 @@ def _execution_log(kind: str, name: str) -> Callable:
         @wraps(func)
         def sync_wrapper(*args, **kwargs):
             fields = trace_fields(args[0] if args else kwargs.get("state"))
-            with logger.contextualize(**fields, **{kind: name}):
+            with logger.contextualize(**fields, **{kind: name}, **source):
                 started = perf_counter()
                 trace_id = fields.get("task_id") or fields.get("request_id") or fields.get("session_id") or "-"
                 trace = f"，追踪ID={trace_id}" if kind == "node" else ""

@@ -1,0 +1,38 @@
+flowchart TD
+    start(["START"])
+    stop(["END"])
+    entry["入口校验<br/>node_entry<br/>任务、文件格式、前端必选内容类型"]
+    save_file["归档原文件<br/>node_save_file<br/>MinIO 原文件、指纹与来源信息"]
+    pdf_parse["PDF 解析 / 转换<br/>node_pdf_parse<br/>MinerU → MD / JSON；超限按页分段"]
+    word_parse["Word 解析 / 转换<br/>node_word_parse<br/>保留段落、表格和嵌图关系"]
+    md_img["统一图片处理与引用<br/>node_md_img<br/>归档 MinIO；保留原位置与图片关联"]
+    document_split["内容整理与切分<br/>node_document_split<br/>文档按章节；课程、题目保留完整单元"]
+    metadata_recognition["教育主体与元数据识别<br/>node_metadata_recognition<br/>课程 / 项目 / 题库 / 题号；内容类型沿用前端选择"]
+    bge_embedding["统一向量化<br/>node_bge_embedding<br/>一级索引和业务内容均生成 dense + sparse"]
+    import_milvus["写入 Milvus<br/>node_import_milvus<br/>一级索引 + 课程 / 文档 / 题目三集合"]
+    finish["核验与发布<br/>node_finish<br/>核对实写结果，写成功清单，结束内存任务"]
+    handle_error["错误收尾<br/>node_handle_error<br/>保留原始错误，清理未发布产物"]
+    start --> entry
+    bge_embedding -.->|"error"| handle_error
+    bge_embedding -.->|"ok"| import_milvus
+    document_split -.->|"error"| handle_error
+    document_split -.->|"ok"| metadata_recognition
+    entry -.->|"error"| handle_error
+    entry -.->|"ok"| save_file
+    finish -.->|"ok"| stop
+    finish -.->|"error"| handle_error
+    import_milvus -.->|"ok"| finish
+    import_milvus -.->|"error"| handle_error
+    md_img -.->|"ok"| document_split
+    md_img -.->|"error"| handle_error
+    metadata_recognition -.->|"ok"| bge_embedding
+    metadata_recognition -.->|"error"| handle_error
+    pdf_parse -.->|"error"| handle_error
+    pdf_parse -.->|"ok"| md_img
+    save_file -.->|"error"| handle_error
+    save_file -.->|"md"| md_img
+    save_file -.->|"pdf"| pdf_parse
+    save_file -.->|"docx"| word_parse
+    word_parse -.->|"error"| handle_error
+    word_parse -.->|"ok"| md_img
+    handle_error --> stop

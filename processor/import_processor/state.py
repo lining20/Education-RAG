@@ -1,7 +1,5 @@
 """导入图的数据合同与初始状态；不创建任务、客户端或模型。
 
-本轮限定只交 State/图，因此必要的轻量 TypedDict 暂放本文件。后续节点
-需要共享这些对象时，再迁至 common/schemas 并保持单一定义，不复制两套。
 TypedDict 只提供类型提示；业务校验由对应节点及公共工具执行。
 """
 
@@ -11,10 +9,10 @@ from typing import Any, Literal, TypedDict
 
 ImportStatus = Literal["pending", "running", "succeeded", "failed"]
 ImportNodeName = Literal[
-    "entry", "save_file", "parse_file", "extract_metadata", "build_records",
-    "embedding", "persist", "finish", "handle_error",
+    "entry", "save_file", "pdf_parse", "word_parse", "md_img", "document_split",
+    "metadata_recognition", "bge_embedding", "import_milvus", "finish", "handle_error",
 ]
-CollectionKey = Literal["courses", "document_chunks", "questions"]
+CollectionKey = Literal["document_index", "courses", "document_chunks", "questions"]
 ContentType = Literal["course_intro", "document_chunk", "project_material", "question"]
 # 元数据、定位和业务 payload 的细节随对应节点完善；这里只允许可序列化数据，
 # 不放 SDK 对象、异常、文件句柄、队列或取消信号。Any 不代表免除节点校验。
@@ -57,15 +55,16 @@ class ContentRecord(TypedDict):
 
 
 class ChunkDraft(TypedDict):
-    """fields 仅含目标集合的字段，不含向量；投影/长度校验仍待工具实现。"""
+    """fields 仅含目标集合的字段，不含向量；字段由内容构建器投影。"""
 
     collection_key: CollectionKey
     fields: DataDict
 
 
 class EmbeddedBatches(TypedDict):
-    """三集合的待 upsert 行；每行含向量，空集合使用 []。"""
+    """四集合的待 upsert 行；每行含向量，空集合使用 []。"""
 
+    document_index: list[DataDict]
     courses: list[DataDict]
     document_chunks: list[DataDict]
     questions: list[DataDict]
@@ -81,6 +80,7 @@ class NodeError(TypedDict):
 
 
 class CollectionCounts(TypedDict):
+    document_index: int
     courses: int
     document_chunks: int
     questions: int
@@ -128,6 +128,7 @@ class ImportState(TypedDict):
     document_metadata: DataDict
     typed_blocks: list[DataDict]
     records: list[ContentRecord]
+    index_drafts: list[DataDict]
     chunks: list[ChunkDraft]
     embedded_records: EmbeddedBatches
     # persist 负责填充实写 ID/数量明细；失败清理仍以 task_id 核对数据库残留，
@@ -164,8 +165,9 @@ def create_initial_state(
         "document_metadata": {},
         "typed_blocks": [],
         "records": [],
+        "index_drafts": [],
         "chunks": [],
-        "embedded_records": {"courses": [], "document_chunks": [], "questions": []},
+        "embedded_records": {"document_index": [], "courses": [], "document_chunks": [], "questions": []},
         "persist_result": {},
         "counts": {
             "files": 0, "records": 0, "rejected_records": 0,
@@ -173,10 +175,10 @@ def create_initial_state(
                 "series": 0, "course": 0, "document_chunk": 0,
                 "project_material": 0, "question": 0,
             },
-            "chunks_by_collection": {"courses": 0, "document_chunks": 0, "questions": 0},
-            "embedded_by_collection": {"courses": 0, "document_chunks": 0, "questions": 0},
+            "chunks_by_collection": {"document_index": 0, "courses": 0, "document_chunks": 0, "questions": 0},
+            "embedded_by_collection": {"document_index": 0, "courses": 0, "document_chunks": 0, "questions": 0},
             "persisted_records": 0,
-            "persisted_by_collection": {"courses": 0, "document_chunks": 0, "questions": 0},
+            "persisted_by_collection": {"document_index": 0, "courses": 0, "document_chunks": 0, "questions": 0},
         },
         "warnings": [],
         "rejected_records": [],
@@ -185,35 +187,3 @@ def create_initial_state(
         "error": None,
         "result": {},
     }
-
-
-if __name__ == "__main__":
-    # 仅验证状态合同，不冒充节点或完整流程测试。
-    metadata = {"course": {"tags": ["Python"]}}
-    first = create_initial_state(
-        task_id="task-1", document_id="doc-1", file_path="input.md",
-        upload_metadata=metadata,
-    )
-    second = create_initial_state(task_id="task-2", document_id="doc-2", file_path="other.md")
-    assert set(first) == set(ImportState.__annotations__)
-    assert first["status"] == "pending" and first["current_node"] == ""
-    assert first["source_file"] is None and first["error"] is None
-    assert first["counts"]["files"] == 0 and first["result"] == {}
-
-    # 同时覆盖跨任务、嵌套字段、各集合/各统计阶段以及调用方元数据的隔离。
-    for key, value in first.items():
-        if isinstance(value, (list, dict)):
-            assert value is not second[key], key
-    first["warnings"].append({"code": "SELF_CHECK"})
-    first["embedded_records"]["courses"].append({"chunk_id": "check-only"})
-    first["counts"]["chunks_by_collection"]["courses"] = 1
-    first["counts"]["records_by_type"]["series"] = 1
-    first["upload_metadata"]["course"]["tags"].append("RAG")
-    assert second["warnings"] == [] and second["embedded_records"]["courses"] == []
-    assert first["embedded_records"]["questions"] == []
-    assert second["counts"]["records_by_type"]["series"] == 0
-    assert second["counts"]["chunks_by_collection"]["courses"] == 0
-    assert first["counts"]["embedded_by_collection"]["courses"] == 0
-    assert first["counts"]["persisted_by_collection"]["courses"] == 0
-    assert metadata == {"course": {"tags": ["Python"]}}
-    print("ImportState 合同与初值隔离检查通过（未运行业务节点）。")
