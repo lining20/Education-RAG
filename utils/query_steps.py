@@ -53,6 +53,7 @@ async def subjects(state, deps):
     ids = []
     if state["subject_name"]:
         ids = await run_sync(deps.retrieval.subjects, {k: [v[1]] for k, v in vectors.items()}, state["subject_name"])
+    logger.info("主体确认：名称={}，排序参考文档数={}；不限制后续本地召回范围", state["subject_name"], len(ids))
     return {"vectors": query_vectors, "document_ids": ids}
 
 
@@ -104,7 +105,10 @@ async def rerank(state, deps):
     if len(scores) != len(candidates) or any(not math.isfinite(float(s)) for s in scores):
         raise OperationError("INVALID_RERANK_RESULT", "重排序返回了无效分数")
     local, web, seen = [], [], set()
-    for score, candidate in sorted(zip(scores, candidates), key=lambda pair: pair[0], reverse=True):
+    # 相关性分数始终优先；仅同分时参考主体命中和 RRF，不修改真实模型分数。
+    ranked = sorted(zip(scores, candidates), key=lambda pair: (
+        float(pair[0]), bool(pair[1].get("subject_match")), pair[1].get("rrf_score", 0)), reverse=True)
+    for score, candidate in ranked:
         key = (candidate.get("collection"), candidate.get("row", {}).get("record_id", candidate["key"]))
         if score >= .15 and key not in seen:
             target = web if candidate.get("kind") == "web" else local

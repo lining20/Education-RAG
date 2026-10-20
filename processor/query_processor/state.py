@@ -18,7 +18,7 @@ class QueryState(TypedDict, total=False):
     rewritten_query: str
     subject_name: str
     clarification: str
-    document_ids: list[str]
+    document_ids: list[str]  # 自动主体命中文档，仅供同分排序参考，不能生成 document_id 硬过滤。
     vectors: dict
     vector_hits: list[dict]
     hyde_hits: list[dict]

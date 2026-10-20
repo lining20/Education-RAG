@@ -4,6 +4,7 @@ import json
 from urllib.parse import quote
 from itertools import zip_longest
 from common.errors import OperationError
+from common.logging.logger import logger
 from utils.clients.milvus_collections import collection_names
 from utils.clients.milvus_utils import create_hybrid_search_requests, escape_milvus_string, hybrid_search
 
@@ -72,7 +73,9 @@ class QueryRetrieval:
         return list(dict.fromkeys(row["document_id"] for row in rows
             if subject.casefold() in row.get("subject_name", "").casefold() and self.published(row, name, cache)))
 
-    def retrieve(self, vectors, scope, filters, document_ids):
+    def retrieve(self, vectors, scope, filters, preferred_document_ids):
+        """只按用户条件限制范围；自动主体命中文档仅作为候选同分排序参考。"""
+        preferred = set(preferred_document_ids or [])
         # 题目专属条件仅在明确选择“题目”范围时生效，残留选择不能排除其他资料。
         if scope != "question":
             filters = {key: value for key, value in filters.items()
@@ -90,11 +93,11 @@ class QueryRetrieval:
                 continue
             conditions = ["embedding_model == " + literal(self.embedding_model)]
             conditions.extend(f"{field} == {literal(value)}" for field, value in filters.items() if value)
-            if document_ids:
-                conditions.append("document_id in " + json.dumps(document_ids, ensure_ascii=False))
             if scope in {"document_chunk", "project_material"}:
                 conditions.append("content_type == " + literal(scope))
             collection = names[target]
+            logger.info("本地检索范围：集合={}，用户筛选字段={}，主体排序参考文档数={}，无自动主体硬过滤",
+                        collection, [key for key, value in filters.items() if value], len(preferred))
             found = []
             fields = ["chunk_id", "record_id", "document_id", "task_id", "content", "record_payload",
                 "payload_object_key", "import_manifest_key", "embedding_model", "source_file_name",
@@ -104,7 +107,8 @@ class QueryRetrieval:
             for row in self._search(collection, vectors, " and ".join(conditions), fields):
                 if self.published(row, collection, cache):
                     found.append({"key": collection + ":" + row["chunk_id"], "kind": "knowledge",
-                                   "collection": collection, "content": row["content"], "row": row})
+                                   "collection": collection, "content": row["content"], "row": row,
+                                   "subject_match": row.get("document_id") in preferred})
             paths.append(found)
         # 跨集合轮流取同名次结果，避免 all 范围被排在首位的课程集合挤占。
         return [item for group in zip_longest(*paths) for item in group if item is not None]
