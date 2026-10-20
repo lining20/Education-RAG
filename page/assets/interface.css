@@ -97,8 +97,11 @@ html:has(body.import-page){height:100%;overflow:hidden}
 @media(prefers-reduced-motion:reduce){::view-transition-group(*),::view-transition-old(*),::view-transition-new(*){animation:none!important}}
 
 /* 加强阅读字重，删除入口保持次要操作的视觉层级。 */
-.composer-options{display:flex;align-items:center;flex-wrap:wrap;gap:10px 22px;margin-top:12px;padding-top:11px;border-top:1px solid var(--tone-333333);color:var(--tone-999999);font-size:12px}
-.composer-options label{display:inline-flex;align-items:center;gap:7px;cursor:pointer;min-height:26px}
+/* 提问选项与发送操作共用底部一行；键盘提示保留在上方。 */
+.composer-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;padding-top:11px;border-top:1px solid var(--tone-333333)}
+.composer-toolbar .tools{flex-shrink:0;align-items:center}
+.composer-options{display:flex;align-items:center;flex-wrap:wrap;flex:1;min-width:0;gap:10px 22px;color:var(--tone-999999);font-size:12px}
+.composer-options label{display:inline-flex;align-items:center;gap:7px;cursor:pointer;min-height:26px;white-space:nowrap}
 .composer-options input{margin:0;width:14px;height:14px;cursor:pointer}
 .composer-options label:hover{color:var(--tone-eeeeee)}
 @media(max-width:650px){.composer-options{gap:6px 15px;font-size:11px}}
