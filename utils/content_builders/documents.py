@@ -1,4 +1,4 @@
-"""文档切分：标题分组 → 长块递归切分 → 同章短块合并，保留原始位置。"""
+"""文档切分：按完整标题分组 → 超过600字细分 → 仅同小节子块合并，保留原始位置。"""
 from pathlib import Path
 from copy import deepcopy
 
@@ -67,6 +67,7 @@ def step_2_split_document_by_title(blocks, entries, file_title) -> list[DataDict
     """
     sections, orphans = [], []
     first_heading = None
+    heading_boundary = False
     for block in blocks:
         entry = entries.get(block["block_id"])
         if not entry or entry["content_type"] not in DOCUMENT_TYPES:
@@ -76,6 +77,7 @@ def step_2_split_document_by_title(blocks, entries, file_title) -> list[DataDict
             continue  # 原图已关联正文，不再把图片语法单独生成一个碎片。
         heading = list(block["heading_path"])
         if block["block_type"] == "heading":
+            heading_boundary = True
             if first_heading is None:
                 first_heading = heading
         # raw_source 保留 Markdown 列表、表格、代码缩进与代码内部空行。
@@ -97,9 +99,10 @@ def step_2_split_document_by_title(blocks, entries, file_title) -> list[DataDict
         if not heading and not sections:
             orphans.extend((part, entry) for part in parts)
             continue
-        if (not sections or sections[-1]["heading"] != heading
+        if (heading_boundary or not sections or sections[-1]["heading"] != heading
                 or _context(sections[-1]["entry"]) != _context(entry)):
             sections.append({"heading": heading or [file_title], "entry": entry, "parts": []})
+        heading_boundary = False
         if orphans:
             sections[-1]["parts"].extend(part for part, _ in orphans)
             orphans = []
@@ -147,31 +150,30 @@ def _render(spans):
                          for s in spans)
 
 
-def _same_chapter(left, right):
-    """只合并同父标题或直接父子段，且课程/项目/章节归属必须一致。"""
-    a, b = left[-1]["section"], right[0]["section"]
-    if _context(a["entry"]) != _context(b["entry"]):
-        return False
-    x, y = a["heading"], b["heading"]
-    return (x == y or (len(x) > 1 and x[:-1] == y[:-1])
-            or x == y[:-1] or y == x[:-1])
+def _same_section(left, right):
+    """参考项目 parent_title 指原始完整标题；仅合并同一原始小节细分的子块。
+
+    用小节对象身份进一步区分同名标题，兄弟标题、父子标题均不跨界合并。
+    """
+    section = left[0]["section"]
+    return all(span["section"] is section for span in [*left, *right])
 
 
 @step_log("step_3_refine_split_and_merge_chunks")
 def step_3_refine_split_and_merge_chunks(sections) -> list[list[DataDict]]:
-    """不超过 1000 字的标题段保持完整；长段以 600 为目标、50 为重叠。
+    """沿用参考项目：超过 600 字的标题段细分，目标600、重叠50。
 
     按段落、换行、中文标点递归细分，最终空分隔符处理无标点长文本。
     代码整体保留，可超过普通长度目标；代码内部不细分、不重叠。
-    不足 400 字的相邻同章片段，合并后不超过 1000 字时合并。
-    400 是合并阈值，不为了凑字数跨越无关的一级标题。
+    当前累计块不超过400字时，仅尝试与同一原始小节的下一子块合并，上限1000。
+    不跨任何独立标题边界，不因下一块较短而回头合并一个已足够长的块。
     """
     candidates = []
     for section in sections:
         text = section["body"]
         prefix = _prefix(section)
         context_size = section["context_size"]
-        if len(prefix) + len(text) + context_size <= CHUNK_MAX_SIZE:
+        if len(prefix) + len(text) + context_size <= CHUNK_SIZE:
             candidates.append([{"section": section, "start": 0, "end": len(text)}])
             continue
         target = max(CHUNK_OVERLAP + 1, CHUNK_SIZE - len(prefix) - context_size)
@@ -202,8 +204,8 @@ def step_3_refine_split_and_merge_chunks(sections) -> list[list[DataDict]]:
             cursor = code_end
     merged = []
     for candidate in candidates:
-        if merged and _same_chapter(merged[-1], candidate):
-            short = min(len(_render(merged[-1])), len(_render(candidate))) < CHUNK_MIN
+        if merged and _same_section(merged[-1], candidate):
+            short = len(_render(merged[-1])) + merged[-1][0]["section"]["context_size"] <= CHUNK_MIN
             combined = _compact_spans([*merged[-1], *candidate])
             if short and len(_render(combined)) + combined[0]["section"]["context_size"] <= CHUNK_MAX_SIZE:
                 merged[-1] = combined
