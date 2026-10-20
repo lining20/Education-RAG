@@ -89,7 +89,10 @@ async def web_search(state, deps):
 
 @step_log("query_step_join_rrf")
 async def join_rrf(state, deps):
-    return {"candidates": reciprocal_rank_fusion([state["vector_hits"], state["hyde_hits"], state["web_hits"]])}
+    candidates = reciprocal_rank_fusion([state["vector_hits"], state["hyde_hits"], state["web_hits"]])
+    logger.info("多路召回融合：本地混合={}，本地HyDE={}，网页={}，融合候选={}",
+                len(state["vector_hits"]), len(state["hyde_hits"]), len(state["web_hits"]), len(candidates))
+    return {"candidates": candidates}
 
 
 @step_log("query_step_rerank")
@@ -100,16 +103,28 @@ async def rerank(state, deps):
     scores = await run_sync(deps.rerank, state["rewritten_query"], [row["content"][:6000] for row in candidates])
     if len(scores) != len(candidates) or any(not math.isfinite(float(s)) for s in scores):
         raise OperationError("INVALID_RERANK_RESULT", "重排序返回了无效分数")
-    ordered, seen = [], set()
+    local, web, seen = [], [], set()
     for score, candidate in sorted(zip(scores, candidates), key=lambda pair: pair[0], reverse=True):
         key = (candidate.get("collection"), candidate.get("row", {}).get("record_id", candidate["key"]))
         if score >= .15 and key not in seen:
-            ordered.append({**candidate, "rerank_score": float(score)})
+            target = web if candidate.get("kind") == "web" else local
+            target.append({**candidate, "rerank_score": float(score)})
             seen.add(key)
-        if len(ordered) >= state["top_k"]:
-            break
+    # 来源各自保持真实分数排序。联网只补充，不让网页挤掉所有合格的本地证据。
+    limit = state["top_k"]
+    local_quota = (limit * 3 + 4) // 5  # 优先保留 60% 本地：3→2、5→3、10→6。
+    ordered = local[:local_quota]
+    ordered.extend(web[:limit - len(ordered)])
+    ordered.extend(local[local_quota:local_quota + limit - len(ordered)])
     references = await run_sync(deps.retrieval.references, ordered, state["session_id"], state["request_id"])
-    return {"references": references}
+    local_count = sum(ref.get("kind") != "web" for ref in references)
+    logger.info("重排来源保留：阈值=0.15，合格本地={}，合格网页={}，最终本地={}，最终网页={}",
+                len(local), len(web), local_count, len(references) - local_count)
+    update = {"references": references}
+    if state.get("use_web") and references and not local_count:
+        update["warnings"] = [{"code": "LOCAL_EVIDENCE_NOT_FOUND",
+            "message": "本轮未找到可用且达到相关性阈值的本地资料，当前回答参考联网结果。"}]
+    return update
 
 
 @step_log("query_step_answer")
