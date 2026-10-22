@@ -22,7 +22,13 @@ function createId(){
  bytes[8]=(bytes[8]&63)|128;
  return Array.from(bytes,byte=>byte.toString(16).padStart(2,'0')).join('');
 }
-let sessionId=createId(), controller=null, busy=false, version=0;
+let sessionId=createId(), controller=null, activeRequest=null, busy=false, version=0;
+function rememberSession(id){
+ sessionId=id;
+ try{sessionStorage.setItem('querySession',id);}catch{}
+ const url=new URL(location.href);url.searchParams.set('session',id);history.replaceState(null,'',url);
+}
+function previousSession(){try{return sessionStorage.getItem('querySession');}catch{return null;}}
 function el(tag,text,cls){const element=document.createElement(tag);if(text!==undefined)element.textContent=text;if(cls)element.className=cls;return element;}
 function showError(id,text){$(id).textContent=text;$(id).hidden=!text;}
 async function api(url,options){const response=await fetch(url,options);const data=await response.json();if(!response.ok)throw Error(data.message||'请求失败');return data;}
@@ -153,11 +159,86 @@ function renderAnswerImages(view,answer,refs,status,html){
  if(gallery.childElementCount)view.body.after(gallery);
 }
 function activateImages(){document.querySelectorAll('img[data-source]').forEach(image=>{image.src=image.dataset.source;delete image.dataset.source;});}
-async function loadSession(id){if(busy)return;const token=++version;try{const data=await api('/api/query/sessions/'+encodeURIComponent(id)+'/messages');if(token!==version)return;sessionId=id;$('messages').replaceChildren();$('sources').replaceChildren();for(const message of data.messages){const view=bubble(message.role,message.text||'');if(message.role==='assistant')renderAnswerContent(view,message.text||'',message.result?.references||[],message.answer_html);if(message.status==='interrupted')view.article.append(el('div','该回答已停止生成','meta'));if(message.role==='assistant'&&message.result?.references){renderAnswerImages(view,message.text||'',message.result.references,message.status||message.result.status,message.answer_html);renderSources(message.result.references);}}activateImages();$('progress').textContent='已加载会话历史';await refreshSessions();}catch(error){showError('queryError',error.message);}}
-async function consumeSSE(response,onEvent){if(!response.ok){let data;try{data=await response.json();}catch{}throw Error(data?.message||'检索请求失败');}if(!response.body)throw Error('浏览器不支持流式读取');const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';async function parse(frame){let event='message',lines=[];for(const line of frame.split('\n')){if(line.startsWith('event:'))event=line.slice(6).trim();if(line.startsWith('data:'))lines.push(line.slice(5).trimStart());}if(lines.length)await onEvent(event,JSON.parse(lines.join('\n')));}try{while(true){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});buffer=buffer.replaceAll('\r\n','\n');let position;while((position=buffer.indexOf('\n\n'))>=0){await parse(buffer.slice(0,position));buffer=buffer.slice(position+2);}if(done){if(buffer.trim())await parse(buffer);break;}}}finally{reader.releaseLock();}}
-$('queryForm').addEventListener('submit',async event=>{event.preventDefault();if(busy)return;const question=$('question').value.trim();if(!question)return;const requestId=createId();const filters={};for(const name of ['series_name','course_name','project_name','chapter_name','source_file_name','question_bank_name','question_code','question_type'])filters[name]=$(name).disabled?'':$(name).value.trim();const payload={session_id:sessionId,request_id:requestId,question,mode:$('mode').value,scope:$('scope').value,filters,top_k:Number($('top_k').value),use_hyde:$('use_hyde').checked,use_web:$('use_web').checked,is_stream:$('is_stream').checked};bubble('user',question);const view=bubble('assistant','正在检索……');const writer=createAnswerWriter(view.body);$('question').value='';$('sources').replaceChildren();$('rewrite').textContent='';showError('queryError','');busyState(true);controller=new AbortController();let text='',terminal=false,failed=false;try{const response=await fetch('/api/query/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),signal:controller.signal});await consumeSSE(response,async(event,data)=>{if(event==='progress'){$('progressBrief').textContent=(data.running_nodes||[]).map(n=>nodeNames[n]||n).join(' · ')||'处理中';$('progress').textContent='正在运行：'+(data.running_nodes||[]).map(n=>nodeNames[n]||n).join('、')+'\n已完成：'+(data.completed_nodes||[]).map(n=>nodeNames[n]||n).join(' → ');}if(event==='sources'){renderSources(data.references,false);$('rewrite').textContent='检索问题：'+data.rewritten_query;}if(event==='delta'&&payload.is_stream){text+=data.text;writer.append(data.text);}if(event==='result'){terminal=true;if(payload.is_stream)await writer.finish(data.answer||'');else writer.flush(data.answer||'');renderAnswerImages(view,data.answer||'',data.references,data.status,data.answer_html);renderSources(data.references);activateImages();$('progress').textContent=data.status==='completed'?'处理完成':data.status==='clarification_required'?'需要补充信息':'未找到充分证据';if(data.warnings?.length)view.article.append(el('div',data.warnings.map(w=>w.message).join('\n'),'meta'));}if(event==='error'){failed=true;terminal=true;writer.flush(text||data.message);showError('queryError',data.message+' ['+data.code+']');$('progress').textContent='本次检索失败';}});if(!terminal&&!failed)throw Error('连接提前结束，未收到完整结果，请重新提问。');}catch(error){if(error.name==='AbortError'){writer.flush(text||'已停止本次生成。');$('progress').textContent='已停止';}else{showError('queryError',error.message);writer.flush(text||'检索未完成，请检查提示后重试。');}}finally{$('progressBrief').textContent=$('progress').textContent;controller=null;busyState(false);await refreshSessions();}});
+async function loadSession(id){
+ if(busy)return;const token=++version;busyState(true);
+ try{
+  const data=await api('/api/query/sessions/'+encodeURIComponent(id)+'/messages');if(token!==version)return;
+  rememberSession(id);$('messages').replaceChildren();$('sources').replaceChildren();
+  const active=new Map((data.active_requests||[]).map(item=>[item.request_id,item]));
+  const views=new Map();
+  for(const message of data.messages){
+   if(message.role==='assistant'&&active.has(message.request_id))continue;
+   const view=bubble(message.role,message.text||'');
+   if(message.role==='user'&&active.has(message.request_id))views.set(message.request_id,bubble('assistant','正在恢复回答……'));
+   if(message.role==='assistant')renderAnswerContent(view,message.text||'',message.result?.references||[],message.answer_html);
+   if(message.status==='interrupted')view.article.append(el('div','该回答已停止生成','meta'));
+   if(message.role==='assistant'&&message.result?.references){renderAnswerImages(view,message.text||'',message.result.references,message.status||message.result.status,message.answer_html);renderSources(message.result.references);}
+  }
+  activateImages();$('progress').textContent='已加载会话历史';
+  for(const item of active.values()){
+   if(!views.has(item.request_id)){bubble('user',item.question);views.set(item.request_id,bubble('assistant','正在恢复回答……'));}
+   await watchQuery(item,views.get(item.request_id));
+  }
+ }catch(error){showError('queryError',error.message);}
+ finally{busyState(false);await refreshSessions();}
+}
+async function consumeSSE(response,onEvent){if(!response.ok){let data;try{data=await response.json();}catch{}throw Object.assign(Error(data?.message||'检索请求失败'),{code:data?.code,status:response.status});}if(!response.body)throw Error('浏览器不支持流式读取');const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';async function parse(frame){let event='message',lines=[];for(const line of frame.split('\n')){if(line.startsWith('event:'))event=line.slice(6).trim();if(line.startsWith('data:'))lines.push(line.slice(5).trimStart());}if(lines.length)await onEvent(event,JSON.parse(lines.join('\n')));}try{while(true){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});buffer=buffer.replaceAll('\r\n','\n');let position;while((position=buffer.indexOf('\n\n'))>=0){await parse(buffer.slice(0,position));buffer=buffer.slice(position+2);}if(done){if(buffer.trim())await parse(buffer);break;}}}finally{reader.releaseLock();}}
+function taskURL(item){return '/api/query/tasks/'+encodeURIComponent(item.session_id)+'/'+encodeURIComponent(item.request_id);}
+async function watchQuery(item,view){
+ const writer=createAnswerWriter(view.body);let text='',terminal=false,delay=500;
+ activeRequest=item;busyState(true);controller=new AbortController();
+ try{
+  while(!terminal){
+   try{
+    const response=await fetch(taskURL(item)+'/events',{signal:controller.signal});
+    await consumeSSE(response,async(event,data)=>{
+     if(event==='snapshot'){
+      $('progressBrief').textContent=(data.running_nodes||[]).map(n=>nodeNames[n]||n).join(' · ')||'处理中';
+      $('progress').textContent='正在运行：'+(data.running_nodes||[]).map(n=>nodeNames[n]||n).join('、')+'\n已完成：'+(data.completed_nodes||[]).map(n=>nodeNames[n]||n).join(' → ');
+      if(data.references){renderSources(data.references,false);$('rewrite').textContent='检索问题：'+(data.rewritten_query||'');}
+      if(item.is_stream){const next=data.answer||'';if(next.startsWith(text))writer.append(next.slice(text.length));else writer.flush(next);text=next;}
+      showError('queryError','');delay=500;
+     }
+     if(event==='result'){
+      terminal=true;if(item.is_stream)await writer.finish(data.answer||'');else writer.flush(data.answer||'');
+      renderAnswerImages(view,data.answer||'',data.references,data.status,data.answer_html);renderSources(data.references);activateImages();
+      $('progress').textContent=data.status==='interrupted'?'已停止':data.status==='completed'?'处理完成':data.status==='clarification_required'?'需要补充信息':'未找到充分证据';
+      if(data.status==='interrupted')view.article.append(el('div','该回答已停止生成','meta'));
+      if(data.warnings?.length)view.article.append(el('div',data.warnings.map(w=>w.message).join('\n'),'meta'));
+      showError('queryError','');
+     }
+     if(event==='error'){terminal=true;writer.flush(text||data.message);showError('queryError',data.message+' ['+data.code+']');$('progress').textContent='本次检索失败';}
+    });
+    if(!terminal)throw Error('进度连接已断开');
+   }catch(error){
+    if(error.name==='AbortError')return;
+    if(error.code==='QUERY_TASK_NOT_FOUND'||(error.status&&error.status<500)){
+     writer.flush(text||'无法恢复任务，请重新加载会话历史。');showError('queryError',error.message);$('progress').textContent='无法恢复任务';return;
+    }
+    showError('queryError','进度连接已断开，正在重新连接。');
+    await new Promise(resolve=>setTimeout(resolve,delay));delay=Math.min(delay*2,5000);
+   }
+  }
+ }finally{if(!terminal)writer.flush(text||view.body.textContent);$('progressBrief').textContent=$('progress').textContent;controller=null;activeRequest=null;}
+}
+$('queryForm').addEventListener('submit',async event=>{
+ event.preventDefault();if(busy)return;const question=$('question').value.trim();if(!question)return;
+ const requestId=createId(),filters={};
+ for(const name of ['series_name','course_name','project_name','chapter_name','source_file_name','question_bank_name','question_code','question_type'])filters[name]=$(name).disabled?'':$(name).value.trim();
+ const payload={session_id:sessionId,request_id:requestId,question,mode:$('mode').value,scope:$('scope').value,filters,top_k:Number($('top_k').value),use_hyde:$('use_hyde').checked,use_web:$('use_web').checked,is_stream:$('is_stream').checked};
+ rememberSession(sessionId);bubble('user',question);const view=bubble('assistant','正在检索……');
+ $('question').value='';$('sources').replaceChildren();$('rewrite').textContent='';showError('queryError','');busyState(true);
+ try{
+  await api('/api/query/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  await watchQuery(payload,view);
+ }catch(error){showError('queryError',error.message);view.body.textContent='提问提交未确认，请重新加载会话查看任务是否已创建。';}
+ finally{busyState(false);await refreshSessions();}
+});
 // 非题目范围禁用题库、题号、题型；保留原选择以便切回题目时继续使用。
 function syncQuestionFilters(){const enabled=$('scope').value==='question';for(const name of ['question_bank_name','question_code','question_type'])$(name).disabled=!enabled;}
 $('scope').addEventListener('change',syncQuestionFilters);syncQuestionFilters();
-$('stop').addEventListener('click',()=>controller?.abort());$('question').addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();$('queryForm').requestSubmit();}});$('newSession').addEventListener('click',()=>{if(busy)return;version++;sessionId=createId();openSources(false);$('sourceCount').textContent='0';$('progressBrief').textContent='教育智库';$('messages').replaceChildren(welcomeTemplate.cloneNode(true));$('sources').replaceChildren();$('progress').textContent='等待提问';$('rewrite').textContent='';showError('queryError','');$('question').focus();refreshSessions();});$('deleteSession').addEventListener('click',async()=>{if(busy)return;if(!window.confirm('确定删除当前会话及其全部聊天记录吗？删除后无法恢复。'))return;try{await api('/api/query/sessions/'+encodeURIComponent(sessionId),{method:'DELETE'});$('newSession').click();}catch(error){showError('queryError',error.message);}});$('messages').addEventListener('click',event=>{const button=event.target.closest('.example');if(button&&!busy){$('question').value=button.querySelector('strong').textContent;$('question').focus();}});const initialSession=new URLSearchParams(location.search).get('session');if(initialSession)loadSession(initialSession);else refreshSessions();
+$('stop').addEventListener('click',async()=>{
+ if(!activeRequest)return;$('stop').disabled=true;
+ try{await api(taskURL(activeRequest)+'/stop',{method:'POST'});}catch(error){showError('queryError','停止失败：'+error.message);}finally{$('stop').disabled=false;}
+});$('question').addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();$('queryForm').requestSubmit();}});$('newSession').addEventListener('click',()=>{if(busy)return;version++;rememberSession(createId());openSources(false);$('sourceCount').textContent='0';$('progressBrief').textContent='教育智库';$('messages').replaceChildren(welcomeTemplate.cloneNode(true));$('sources').replaceChildren();$('progress').textContent='等待提问';$('rewrite').textContent='';showError('queryError','');$('question').focus();refreshSessions();});$('deleteSession').addEventListener('click',async()=>{if(busy)return;if(!window.confirm('确定删除当前会话及其全部聊天记录吗？删除后无法恢复。'))return;try{await api('/api/query/sessions/'+encodeURIComponent(sessionId),{method:'DELETE'});$('newSession').click();}catch(error){showError('queryError',error.message);}});$('messages').addEventListener('click',event=>{const button=event.target.closest('.example');if(button&&!busy){$('question').value=button.querySelector('strong').textContent;$('question').focus();}});const initialSession=new URLSearchParams(location.search).get('session')||previousSession();if(initialSession)loadSession(initialSession);else refreshSessions();
 </script></body></html>

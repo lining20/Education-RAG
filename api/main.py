@@ -301,7 +301,7 @@ def create_app(*, service=None, query_service=None):
 
     @app.exception_handler(OperationError)
     async def operation_error(request, exc):
-        status = 401 if exc.code == "INVALID_CREDENTIALS" else 429 if exc.code == "LOGIN_RATE_LIMITED" else 404 if exc.code in {"TASK_NOT_FOUND", "REFERENCE_NOT_FOUND", "REFERENCE_EXPIRED"} else 413 if exc.code == "FILE_TOO_LARGE" else 503 if exc.retryable else 400
+        status = 401 if exc.code == "INVALID_CREDENTIALS" else 429 if exc.code == "LOGIN_RATE_LIMITED" else 404 if exc.code in {"TASK_NOT_FOUND", "QUERY_TASK_NOT_FOUND", "REFERENCE_NOT_FOUND", "REFERENCE_EXPIRED"} else 413 if exc.code == "FILE_TOO_LARGE" else 503 if exc.retryable else 400
         return JSONResponse(status_code=status, content={"code": exc.code, "message": exc.message})
 
     @app.exception_handler(RequestValidationError)
